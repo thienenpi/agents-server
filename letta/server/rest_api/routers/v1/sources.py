@@ -16,6 +16,7 @@ from letta.schemas.file import FileMetadata
 from letta.schemas.job import Job
 from letta.schemas.passage import Passage
 from letta.schemas.source import Source, SourceCreate, SourceUpdate
+from letta.schemas.user import User
 from letta.server.rest_api.utils import get_letta_server
 from letta.server.server import SyncServer
 from letta.utils import sanitize_filename
@@ -37,7 +38,10 @@ def get_source(
     """
     actor = server.get_user_or_default(user_id=user_id)
 
-    return server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
+    source = server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source with id={source_id} not found.")
+    return source
 
 
 @router.get("/name/{source_name}", response_model=str, operation_id="get_source_id_by_name")
@@ -52,6 +56,8 @@ def get_source_id_by_name(
     actor = server.get_user_or_default(user_id=user_id)
 
     source = server.source_manager.get_source_by_name(source_name=source_name, actor=actor)
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source with name={source_name} not found.")
     return source.id
 
 
@@ -94,6 +100,8 @@ def update_source(
     Update the name or documentation of an existing data source.
     """
     actor = server.get_user_or_default(user_id=user_id)
+    if not server.source_manager.get_source_by_id(source_id=source_id, actor=actor):
+        raise HTTPException(status_code=404, detail=f"Source with id={source_id} does not exist.")
     return server.source_manager.update_source(source_id=source_id, source_update=source, actor=actor)
 
 
@@ -168,13 +176,14 @@ def upload_file_to_source(
         completed_at=None,
     )
     job_id = job.id
-    server.ms.create_job(job)
+    server.job_manager.create_job(job, actor=actor)
 
     # create background task
-    background_tasks.add_task(load_file_to_source_async, server, source_id=source.id, file=file, job_id=job.id, bytes=bytes)
+    background_tasks.add_task(load_file_to_source_async, server, source_id=source.id, file=file, job_id=job.id, bytes=bytes, actor=actor)
 
     # return job information
-    job = server.ms.get_job(job_id=job_id)
+    # Is this necessary? Can we just return the job from create_job?
+    job = server.job_manager.get_job_by_id(job_id=job_id, actor=actor)
     assert job is not None, "Job not found"
     return job
 
@@ -227,7 +236,7 @@ def delete_file_from_source(
         raise HTTPException(status_code=404, detail=f"File with id={file_id} not found.")
 
 
-def load_file_to_source_async(server: SyncServer, source_id: str, job_id: str, file: UploadFile, bytes: bytes):
+def load_file_to_source_async(server: SyncServer, source_id: str, job_id: str, file: UploadFile, bytes: bytes, actor: User):
     # Create a temporary directory (deleted after the context manager exits)
     with tempfile.TemporaryDirectory() as tmpdirname:
         # Sanitize the filename
@@ -239,4 +248,4 @@ def load_file_to_source_async(server: SyncServer, source_id: str, job_id: str, f
             buffer.write(bytes)
 
         # Pass the file to load_file_to_source
-        server.load_file_to_source(source_id, file_path, job_id)
+        server.load_file_to_source(source_id, file_path, job_id, actor)

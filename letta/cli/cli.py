@@ -10,7 +10,12 @@ import letta.utils as utils
 from letta import create_client
 from letta.agent import Agent, save_agent
 from letta.config import LettaConfig
-from letta.constants import CLI_WARNING_PREFIX, LETTA_DIR, MIN_CONTEXT_WINDOW
+from letta.constants import (
+    CLI_WARNING_PREFIX,
+    CORE_MEMORY_BLOCK_CHAR_LIMIT,
+    LETTA_DIR,
+    MIN_CONTEXT_WINDOW,
+)
 from letta.local_llm.constants import ASSISTANT_MESSAGE_CLI_SYMBOL
 from letta.log import get_logger
 from letta.metadata import MetadataStore
@@ -46,8 +51,9 @@ def server(
     port: Annotated[Optional[int], typer.Option(help="Port to run the server on")] = None,
     host: Annotated[Optional[str], typer.Option(help="Host to run the server on (default to localhost)")] = None,
     debug: Annotated[bool, typer.Option(help="Turn debugging output on")] = False,
-    ade: Annotated[bool, typer.Option(help="Allows remote access")] = False,
+    ade: Annotated[bool, typer.Option(help="Allows remote access")] = False,  # NOTE: deprecated
     secure: Annotated[bool, typer.Option(help="Adds simple security access")] = False,
+    localhttps: Annotated[bool, typer.Option(help="Setup local https")] = False,
 ):
     """Launch a Letta server process"""
     if type == ServerChoice.rest_api:
@@ -91,7 +97,7 @@ def run(
     ] = None,
     core_memory_limit: Annotated[
         Optional[int], typer.Option(help="The character limit to each core-memory section (human/persona).")
-    ] = 2000,
+    ] = CORE_MEMORY_BLOCK_CHAR_LIMIT,
     # other
     first: Annotated[bool, typer.Option(help="Use --first to send the first message in the sequence")] = False,
     strip_ui: Annotated[bool, typer.Option(help="Remove all the bells and whistles in CLI output (helpful for testing)")] = False,
@@ -166,7 +172,6 @@ def run(
         # printd("State path:", agent_config.save_state_dir())
         # printd("Persistent manager path:", agent_config.save_persistence_manager_dir())
         # printd("Index path:", agent_config.save_agent_index_dir())
-        # persistence_manager = LocalStateManager(agent_config).load() # TODO: implement load
         # TODO: load prior agent state
 
         # Allow overriding model specifics (model, model wrapper, model endpoint IP + type, context_window)
@@ -220,7 +225,8 @@ def run(
 
         # create agent
         tools = [server.tool_manager.get_tool_by_name(tool_name=tool_name, actor=client.user) for tool_name in agent_state.tool_names]
-        letta_agent = Agent(agent_state=agent_state, interface=interface(), tools=tools, user=client.user)
+        agent_state.tools = tools
+        letta_agent = Agent(agent_state=agent_state, interface=interface(), user=client.user)
 
     else:  # create new agent
         # create new agent config: override defaults with args if provided
@@ -366,8 +372,7 @@ def delete_agent(
         sys.exit(1)
 
 
-def version():
+def version() -> str:
     import letta
 
-    print(letta.__version__)
     return letta.__version__

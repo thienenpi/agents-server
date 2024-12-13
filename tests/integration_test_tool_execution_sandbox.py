@@ -5,12 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from composio import Action
 from sqlalchemy import delete
 
 from letta import create_client
-from letta.functions.functions import parse_source_code
-from letta.functions.schema_generator import generate_schema
+from letta.functions.function_sets.base import core_memory_replace
 from letta.orm import SandboxConfig, SandboxEnvironmentVariable
 from letta.schemas.agent import AgentState
 from letta.schemas.embedding_config import EmbeddingConfig
@@ -33,6 +31,7 @@ from letta.services.tool_execution_sandbox import ToolExecutionSandbox
 from letta.services.tool_manager import ToolManager
 from letta.services.user_manager import UserManager
 from letta.settings import tool_settings
+from tests.helpers.utils import create_tool_from_func
 
 # Constants
 namespace = uuid.NAMESPACE_DNS
@@ -56,21 +55,6 @@ def clear_tables():
 
     for sandbox in Sandbox.list():
         Sandbox.connect(sandbox.sandbox_id).kill()
-
-
-@pytest.fixture
-def mock_e2b_api_key_none():
-    # Store the original value of e2b_api_key
-    original_api_key = tool_settings.e2b_api_key
-
-    # Set e2b_api_key to None
-    tool_settings.e2b_api_key = None
-
-    # Yield control to the test
-    yield
-
-    # Restore the original value of e2b_api_key
-    tool_settings.e2b_api_key = original_api_key
 
 
 @pytest.fixture
@@ -164,6 +148,44 @@ def get_env_tool(test_user):
 
 
 @pytest.fixture
+def get_warning_tool(test_user):
+    def warn_hello_world() -> str:
+        """
+        Simple function that warns hello world.
+
+        Returns:
+            str: hello world
+        """
+        import warnings
+
+        msg = "Hello World"
+        warnings.warn(msg)
+        return msg
+
+    tool = create_tool_from_func(warn_hello_world)
+    tool = ToolManager().create_or_update_tool(tool, test_user)
+    yield tool
+
+
+@pytest.fixture
+def always_err_tool(test_user):
+    def error() -> str:
+        """
+        Simple function that errors
+
+        Returns:
+            str: not important
+        """
+        # Raise a unusual error so we know it's from this function
+        print("Going to error now")
+        raise ZeroDivisionError("This is an intentionally weird division!")
+
+    tool = create_tool_from_func(error)
+    tool = ToolManager().create_or_update_tool(tool, test_user)
+    yield tool
+
+
+@pytest.fixture
 def list_tool(test_user):
     def create_list():
         """Simple function that returns a list"""
@@ -178,13 +200,13 @@ def list_tool(test_user):
 @pytest.fixture
 def composio_github_star_tool(test_user):
     tool_manager = ToolManager()
-    tool_create = ToolCreate.from_composio(action=Action.GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER)
+    tool_create = ToolCreate.from_composio(action_name="GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER")
     tool = tool_manager.create_or_update_tool(pydantic_tool=Tool(**tool_create.model_dump()), actor=test_user)
     yield tool
 
 
 @pytest.fixture
-def clear_core_memory(test_user):
+def clear_core_memory_tool(test_user):
     def clear_memory(agent_state: AgentState):
         """Clear the core memory"""
         agent_state.memory.get_block("human").value = ""
@@ -195,19 +217,65 @@ def clear_core_memory(test_user):
     yield tool
 
 
-# Utility functions
-def create_tool_from_func(func: callable):
-    return Tool(
-        name=func.__name__,
-        description="",
-        source_type="python",
-        tags=[],
-        source_code=parse_source_code(func),
-        json_schema=generate_schema(func, None),
+@pytest.fixture
+def core_memory_replace_tool(test_user):
+    tool = create_tool_from_func(core_memory_replace)
+    tool = ToolManager().create_or_update_tool(tool, test_user)
+    yield tool
+
+
+@pytest.fixture
+def external_codebase_tool(test_user):
+    from tests.test_tool_sandbox.restaurant_management_system.adjust_menu_prices import (
+        adjust_menu_prices,
     )
+
+    tool = create_tool_from_func(adjust_menu_prices)
+    tool = ToolManager().create_or_update_tool(tool, test_user)
+    yield tool
+
+
+@pytest.fixture
+def agent_state():
+    client = create_client()
+    agent_state = client.create_agent(
+        memory=ChatMemory(persona="This is the persona", human="My name is Chad"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        llm_config=LLMConfig.default_config(model_name="gpt-4"),
+    )
+    yield agent_state
+
+
+@pytest.fixture
+def custom_test_sandbox_config(test_user):
+    """
+    Fixture to create a consistent local sandbox configuration for tests.
+
+    Args:
+        test_user: The test user to be used for creating the sandbox configuration.
+
+    Returns:
+        A tuple containing the SandboxConfigManager and the created sandbox configuration.
+    """
+    # Create the SandboxConfigManager
+    manager = SandboxConfigManager(tool_settings)
+
+    # Set the sandbox to be within the external codebase path and use a venv
+    external_codebase_path = str(Path(__file__).parent / "test_tool_sandbox" / "restaurant_management_system")
+    local_sandbox_config = LocalSandboxConfig(sandbox_dir=external_codebase_path, use_venv=True)
+
+    # Create the sandbox configuration
+    config_create = SandboxConfigCreate(config=local_sandbox_config.model_dump())
+
+    # Create or update the sandbox configuration
+    manager.create_or_update_sandbox_config(sandbox_config_create=config_create, actor=test_user)
+
+    return manager, local_sandbox_config
 
 
 # Local sandbox tests
+
+
 @pytest.mark.local_sandbox
 def test_local_sandbox_default(mock_e2b_api_key_none, add_integers_tool, test_user):
     args = {"x": 10, "y": 5}
@@ -225,22 +293,38 @@ def test_local_sandbox_default(mock_e2b_api_key_none, add_integers_tool, test_us
 
 
 @pytest.mark.local_sandbox
-def test_local_sandbox_stateful_tool(mock_e2b_api_key_none, clear_core_memory, test_user):
+def test_local_sandbox_stateful_tool(mock_e2b_api_key_none, clear_core_memory_tool, test_user, agent_state):
     args = {}
-
-    client = create_client()
-    agent_state = client.create_agent(
-        memory=ChatMemory(persona="This is the persona", human="This is the human"),
-        embedding_config=EmbeddingConfig.default_config(provider="openai"),
-        llm_config=LLMConfig.default_config(model_name="gpt-4"),
-    )
-
     # Run again to get actual response
-    sandbox = ToolExecutionSandbox(clear_core_memory.name, args, user_id=test_user.id)
+    sandbox = ToolExecutionSandbox(clear_core_memory_tool.name, args, user_id=test_user.id)
     result = sandbox.run(agent_state=agent_state)
     assert result.agent_state.memory.get_block("human").value == ""
     assert result.agent_state.memory.get_block("persona").value == ""
     assert result.func_return is None
+
+
+@pytest.mark.local_sandbox
+def test_local_sandbox_core_memory_replace(mock_e2b_api_key_none, core_memory_replace_tool, test_user, agent_state):
+    new_name = "Matt"
+    args = {"label": "human", "old_content": "Chad", "new_content": new_name}
+    sandbox = ToolExecutionSandbox(core_memory_replace_tool.name, args, user_id=test_user.id)
+
+    # run the sandbox
+    result = sandbox.run(agent_state=agent_state)
+    assert new_name in result.agent_state.memory.get_block("human").value
+    assert result.func_return is None
+
+
+@pytest.mark.local_sandbox
+def test_local_sandbox_core_memory_replace_errors(mock_e2b_api_key_none, core_memory_replace_tool, test_user, agent_state):
+    nonexistent_name = "Alexander Wang"
+    args = {"label": "human", "old_content": nonexistent_name, "new_content": "Matt"}
+    sandbox = ToolExecutionSandbox(core_memory_replace_tool.name, args, user_id=test_user.id)
+
+    # run the sandbox
+    result = sandbox.run(agent_state=agent_state)
+    assert len(result.stderr) != 0, "stderr not empty"
+    assert f"ValueError: Old content '{nonexistent_name}' not found in memory block 'human'" in result.stderr[0], "stderr contains expected error"
 
 
 @pytest.mark.local_sandbox
@@ -290,6 +374,41 @@ def test_local_sandbox_e2e_composio_star_github(mock_e2b_api_key_none, check_com
 
     result = ToolExecutionSandbox(composio_github_star_tool.name, {"owner": "letta-ai", "repo": "letta"}, user_id=test_user.id).run()
     assert result.func_return["details"] == "Action executed successfully"
+
+
+@pytest.mark.local_sandbox
+def test_local_sandbox_external_codebase(mock_e2b_api_key_none, custom_test_sandbox_config, external_codebase_tool, test_user):
+    # Set the args
+    args = {"percentage": 10}
+
+    # Run again to get actual response
+    sandbox = ToolExecutionSandbox(external_codebase_tool.name, args, user_id=test_user.id)
+    result = sandbox.run()
+
+    # Assert that the function return is correct
+    assert result.func_return == "Price Adjustments:\nBurger: $8.99 -> $9.89\nFries: $2.99 -> $3.29\nSoda: $1.99 -> $2.19"
+    assert "Hello World" in result.stdout[0]
+
+
+@pytest.mark.local_sandbox
+def test_local_sandbox_with_venv_and_warnings_does_not_error(
+    mock_e2b_api_key_none, custom_test_sandbox_config, get_warning_tool, test_user
+):
+    sandbox = ToolExecutionSandbox(get_warning_tool.name, {}, user_id=test_user.id)
+    result = sandbox.run()
+    assert result.func_return == "Hello World"
+
+
+@pytest.mark.e2b_sandbox
+def test_local_sandbox_with_venv_errors(mock_e2b_api_key_none, custom_test_sandbox_config, always_err_tool, test_user):
+    sandbox = ToolExecutionSandbox(always_err_tool.name, {}, user_id=test_user.id)
+
+    # run the sandbox
+    result = sandbox.run()
+    assert len(result.stdout) != 0, "stdout not empty"
+    assert "error" in result.stdout[0], "stdout contains printed string"
+    assert len(result.stderr) != 0, "stderr not empty"
+    assert "ZeroDivisionError: This is an intentionally weird division!" in result.stderr[0], "stderr contains expected error"
 
 
 # E2B sandbox tests
@@ -345,22 +464,50 @@ def test_e2b_sandbox_reuses_same_sandbox(check_e2b_key_is_set, list_tool, test_u
 
 
 @pytest.mark.e2b_sandbox
-def test_e2b_sandbox_stateful_tool(check_e2b_key_is_set, clear_core_memory, test_user):
-    sandbox = ToolExecutionSandbox(clear_core_memory.name, {}, user_id=test_user.id)
-
-    # create an agent
-    client = create_client()
-    agent_state = client.create_agent(
-        memory=ChatMemory(persona="This is the persona", human="This is the human"),
-        embedding_config=EmbeddingConfig.default_config(provider="openai"),
-        llm_config=LLMConfig.default_config(model_name="gpt-4"),
-    )
+def test_e2b_sandbox_stateful_tool(check_e2b_key_is_set, clear_core_memory_tool, test_user, agent_state):
+    sandbox = ToolExecutionSandbox(clear_core_memory_tool.name, {}, user_id=test_user.id)
 
     # run the sandbox
     result = sandbox.run(agent_state=agent_state)
     assert result.agent_state.memory.get_block("human").value == ""
     assert result.agent_state.memory.get_block("persona").value == ""
     assert result.func_return is None
+
+
+@pytest.mark.e2b_sandbox
+def test_e2b_sandbox_core_memory_replace(check_e2b_key_is_set, core_memory_replace_tool, test_user, agent_state):
+    new_name = "Matt"
+    args = {"label": "human", "old_content": "Chad", "new_content": new_name}
+    sandbox = ToolExecutionSandbox(core_memory_replace_tool.name, args, user_id=test_user.id)
+
+    # run the sandbox
+    result = sandbox.run(agent_state=agent_state)
+    assert new_name in result.agent_state.memory.get_block("human").value
+    assert result.func_return is None
+
+
+@pytest.mark.e2b_sandbox
+def test_e2b_sandbox_escape_strings_in_args(check_e2b_key_is_set, core_memory_replace_tool, test_user, agent_state):
+    new_name = "Matt"
+    args = {"label": "human", "old_content": "Chad", "new_content": new_name + "\n"}
+    sandbox = ToolExecutionSandbox(core_memory_replace_tool.name, args, user_id=test_user.id)
+
+    # run the sandbox
+    result = sandbox.run(agent_state=agent_state)
+    assert new_name in result.agent_state.memory.get_block("human").value
+    assert result.func_return is None
+
+
+@pytest.mark.e2b_sandbox
+def test_e2b_sandbox_core_memory_replace_errors(check_e2b_key_is_set, core_memory_replace_tool, test_user, agent_state):
+    nonexistent_name = "Alexander Wang"
+    args = {"label": "human", "old_content": nonexistent_name, "new_content": "Matt"}
+    sandbox = ToolExecutionSandbox(core_memory_replace_tool.name, args, user_id=test_user.id)
+
+    # run the sandbox
+    result = sandbox.run(agent_state=agent_state)
+    assert len(result.stderr) != 0, "stderr not empty"
+    assert f"ValueError: Old content '{nonexistent_name}' not found in memory block 'human'" in result.stderr[0], "stderr contains expected error"
 
 
 @pytest.mark.e2b_sandbox

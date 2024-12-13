@@ -170,8 +170,7 @@ def check_agent_uses_external_tool(filename: str) -> LettaResponse:
     # Set up client
     client = create_client()
     cleanup(client=client, agent_uuid=agent_uuid)
-    # tool = client.load_composio_tool(action=Action.GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER)
-    tool = client.load_composio_tool(action=Action.WEBTOOL_SCRAPE_WEBSITE_CONTENT)
+    tool = client.load_composio_tool(action=Action.GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER)
     tool_name = tool.name
 
     # Set up persona for tool usage
@@ -211,11 +210,10 @@ def check_agent_recall_chat_memory(filename: str) -> LettaResponse:
     cleanup(client=client, agent_uuid=agent_uuid)
 
     human_name = "BananaBoy"
-    agent_state = setup_agent(client, filename, memory_human_str=f"My name is {human_name}")
-
-    print("MEMORY", agent_state.memory.get_block("human").value)
-
-    response = client.user_message(agent_id=agent_state.id, message="Repeat my name back to me.")
+    agent_state = setup_agent(client, filename, memory_human_str=f"My name is {human_name}.")
+    response = client.user_message(
+        agent_id=agent_state.id, message="Repeat my name back to me. You should search in your human memory block."
+    )
 
     # Basic checks
     assert_sanity_checks(response)

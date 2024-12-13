@@ -4,12 +4,13 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS
 from letta.schemas.block import CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.letta_base import LettaBase
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
-from letta.schemas.message import Message
+from letta.schemas.message import Message, MessageCreate
 from letta.schemas.openai.chat_completion_response import UsageStatistics
 from letta.schemas.source import Source
 from letta.schemas.tool import Tool
@@ -33,6 +34,8 @@ class AgentType(str, Enum):
     memgpt_agent = "memgpt_agent"
     split_thread_agent = "split_thread_agent"
     o1_agent = "o1_agent"
+    offline_memory_agent = "offline_memory_agent"
+    chat_only_agent = "chat_only_agent"
 
 
 class PersistedAgentState(BaseAgent, validate_assignment=True):
@@ -43,7 +46,6 @@ class PersistedAgentState(BaseAgent, validate_assignment=True):
 
     # in-context memory
     message_ids: Optional[List[str]] = Field(default=None, description="The ids of the messages in the agent's in-context memory.")
-
     # tools
     # TODO: move to ORM mapping
     tool_names: List[str] = Field(..., description="The tools used by the agent.")
@@ -115,16 +117,16 @@ class CreateAgent(BaseAgent):  #
         description="The blocks to create in the agent's in-context memory.",
     )
 
-    tools: Optional[List[str]] = Field(None, description="The tools used by the agent.")
+    tools: List[str] = Field(BASE_TOOLS + BASE_MEMORY_TOOLS, description="The tools used by the agent.")
     tool_rules: Optional[List[ToolRule]] = Field(None, description="The tool rules governing the agent.")
     tags: Optional[List[str]] = Field(None, description="The tags associated with the agent.")
     system: Optional[str] = Field(None, description="The system prompt used by the agent.")
-    agent_type: Optional[AgentType] = Field(None, description="The type of agent.")
+    agent_type: AgentType = Field(AgentType.memgpt_agent, description="The type of agent.")
     llm_config: Optional[LLMConfig] = Field(None, description="The LLM configuration used by the agent.")
     embedding_config: Optional[EmbeddingConfig] = Field(None, description="The embedding configuration used by the agent.")
     # Note: if this is None, then we'll populate with the standard "more human than human" initial message sequence
     # If the client wants to make this empty, then the client can set the arg to an empty list
-    initial_message_sequence: Optional[List[Message]] = Field(
+    initial_message_sequence: Optional[List[MessageCreate]] = Field(
         None, description="The initial set of messages to put in the agent's in-context memory."
     )
 

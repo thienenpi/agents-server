@@ -19,11 +19,17 @@ class SandboxRunResult(BaseModel):
     func_return: Optional[Any] = Field(None, description="The function return object")
     agent_state: Optional[AgentState] = Field(None, description="The agent state")
     stdout: Optional[List[str]] = Field(None, description="Captured stdout (e.g. prints, logs) from the function invocation")
+    stderr: Optional[List[str]] = Field(None, description="Captured stderr from the function invocation")
     sandbox_config_fingerprint: str = Field(None, description="The fingerprint of the config for the sandbox")
 
 
 class LocalSandboxConfig(BaseModel):
     sandbox_dir: str = Field(..., description="Directory for the sandbox environment.")
+    use_venv: bool = Field(False, description="Whether or not to use the venv, or run directly in the same run loop.")
+    venv_name: str = Field(
+        "venv",
+        description="The name for the venv in the sandbox directory. We first search for an existing venv with this name, otherwise, we make it from the requirements.txt.",
+    )
 
     @property
     def type(self) -> "SandboxType":
