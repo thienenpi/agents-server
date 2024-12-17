@@ -61,7 +61,7 @@ def setup_agent(
     filename: str,
     memory_human_str: str = get_human_text(DEFAULT_HUMAN),
     memory_persona_str: str = get_persona_text(DEFAULT_PERSONA),
-    tools: Optional[List[str]] = None,
+    tool_ids: Optional[List[str]] = None,
     tool_rules: Optional[List[BaseToolRule]] = None,
     agent_uuid: str = agent_uuid,
 ) -> AgentState:
@@ -77,7 +77,7 @@ def setup_agent(
 
     memory = ChatMemory(human=memory_human_str, persona=memory_persona_str)
     agent_state = client.create_agent(
-        name=agent_uuid, llm_config=llm_config, embedding_config=embedding_config, memory=memory, tools=tools, tool_rules=tool_rules
+        name=agent_uuid, llm_config=llm_config, embedding_config=embedding_config, memory=memory, tool_ids=tool_ids, tool_rules=tool_rules
     )
 
     return agent_state
@@ -103,7 +103,6 @@ def check_first_response_is_valid_for_llm_endpoint(filename: str) -> ChatComplet
     cleanup(client=client, agent_uuid=agent_uuid)
     agent_state = setup_agent(client, filename)
 
-    tools = [client.get_tool(client.get_tool_id(name=name)) for name in agent_state.tool_names]
     full_agent_state = client.get_agent(agent_state.id)
     agent = Agent(agent_state=full_agent_state, interface=None, user=client.user)
 
@@ -170,21 +169,19 @@ def check_agent_uses_external_tool(filename: str) -> LettaResponse:
     # Set up client
     client = create_client()
     cleanup(client=client, agent_uuid=agent_uuid)
-    # tool = client.load_composio_tool(action=Action.GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER)
-    tool = client.load_composio_tool(action=Action.WEBTOOL_SCRAPE_WEBSITE_CONTENT)
-    tool_name = tool.name
+    tool = client.load_composio_tool(action=Action.GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER)
 
     # Set up persona for tool usage
     persona = f"""
 
     My name is Letta.
 
-    I am a personal assistant who answers a user's questions about a website `example.com`. When a user asks me a question about `example.com`, I will use a tool called {tool_name} which will search `example.com` and answer the relevant question.
+    I am a personal assistant who answers a user's questions about a website `example.com`. When a user asks me a question about `example.com`, I will use a tool called {tool.name} which will search `example.com` and answer the relevant question.
 
     Don’t forget - inner monologue / inner thoughts should always be different than the contents of send_message! send_message is how you communicate with the user, whereas inner thoughts are your own personal inner thoughts.
     """
 
-    agent_state = setup_agent(client, filename, memory_persona_str=persona, tools=[tool_name])
+    agent_state = setup_agent(client, filename, memory_persona_str=persona, tool_ids=[tool.id])
 
     response = client.user_message(agent_id=agent_state.id, message="What's on the example.com website?")
 
@@ -192,7 +189,7 @@ def check_agent_uses_external_tool(filename: str) -> LettaResponse:
     assert_sanity_checks(response)
 
     # Make sure the tool was called
-    assert_invoked_function_call(response.messages, tool_name)
+    assert_invoked_function_call(response.messages, tool.name)
 
     # Make sure some inner monologue is present
     assert_inner_monologue_is_present_and_valid(response.messages)
@@ -211,11 +208,10 @@ def check_agent_recall_chat_memory(filename: str) -> LettaResponse:
     cleanup(client=client, agent_uuid=agent_uuid)
 
     human_name = "BananaBoy"
-    agent_state = setup_agent(client, filename, memory_human_str=f"My name is {human_name}")
-
-    print("MEMORY", agent_state.memory.get_block("human").value)
-
-    response = client.user_message(agent_id=agent_state.id, message="Repeat my name back to me.")
+    agent_state = setup_agent(client, filename, memory_human_str=f"My name is {human_name}.")
+    response = client.user_message(
+        agent_id=agent_state.id, message="Repeat my name back to me. You should search in your human memory block."
+    )
 
     # Basic checks
     assert_sanity_checks(response)
@@ -336,7 +332,7 @@ def check_agent_summarize_memory_simple(filename: str) -> LettaResponse:
     client.user_message(agent_id=agent_state.id, message="Does the number 42 ring a bell?")
 
     # Summarize
-    agent = client.server.load_agent(agent_id=agent_state.id)
+    agent = client.server.load_agent(agent_id=agent_state.id, actor=client.user)
     agent.summarize_messages_inplace()
     print(f"Summarization succeeded: messages[1] = \n\n{json_dumps(agent.messages[1])}\n")
 

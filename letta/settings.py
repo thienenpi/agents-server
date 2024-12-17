@@ -17,6 +17,8 @@ class ToolSettings(BaseSettings):
 
 class ModelSettings(BaseSettings):
 
+    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+
     # env_prefix='my_prefix_'
 
     # when we use /completions APIs (instead of /chat/completions), we need to specify a model wrapper
@@ -62,7 +64,7 @@ cors_origins = ["http://letta.localhost", "http://localhost:8283", "http://local
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="letta_")
+    model_config = SettingsConfigDict(env_prefix="letta_", extra='ignore')
 
     letta_dir: Optional[Path] = Field(Path.home() / ".letta", env="LETTA_DIR")
     debug: Optional[bool] = False
@@ -89,7 +91,7 @@ class Settings(BaseSettings):
             return f"postgresql+pg8000://letta:letta@localhost:5432/letta"
 
     # add this property to avoid being returned the default
-    # reference: https://github.com/cpacker/Letta/issues/1362
+    # reference: https://github.com/letta-ai/letta/issues/1362
     @property
     def letta_pg_uri_no_default(self) -> str:
         if self.pg_uri:
@@ -101,7 +103,7 @@ class Settings(BaseSettings):
 
 
 class TestSettings(Settings):
-    model_config = SettingsConfigDict(env_prefix="letta_test_")
+    model_config = SettingsConfigDict(env_prefix="letta_test_", extra='ignore')
 
     letta_dir: Optional[Path] = Field(Path.home() / ".letta/test", env="LETTA_TEST_DIR")
 

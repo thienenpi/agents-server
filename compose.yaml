@@ -59,8 +59,3 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf
     ports:
       - "80:80"
-  tc_integrate:
-    image: thiennp03/tc_integrate:latest
-    hostname: tc_integrate
-    ports:
-      - "8000:8000"

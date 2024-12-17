@@ -1,13 +1,11 @@
 import datetime
 import inspect
+import time
 import traceback
 import warnings
 from abc import ABC, abstractmethod
 from typing import List, Literal, Optional, Tuple, Union
 
-from tqdm import tqdm
-
-from letta.agent_store.storage import StorageConnector
 from letta.constants import (
     BASE_TOOLS,
     CLI_WARNING_PREFIX,
@@ -18,6 +16,7 @@ from letta.constants import (
     MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST,
     MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC,
     MESSAGE_SUMMARY_WARNING_FRAC,
+    O1_BASE_TOOLS,
     REQ_HEARTBEAT_MESSAGE,
 )
 from letta.errors import LLMError
@@ -26,16 +25,14 @@ from letta.interface import AgentInterface
 from letta.llm_api.helpers import is_context_overflow_error
 from letta.llm_api.llm_api_tools import create
 from letta.local_llm.utils import num_tokens_from_functions, num_tokens_from_messages
-from letta.memory import ArchivalMemory, RecallMemory, summarize_messages
-from letta.metadata import MetadataStore
+from letta.memory import summarize_messages
 from letta.orm import User
-from letta.persistence_manager import LocalStateManager
-from letta.schemas.agent import AgentState, AgentStepResponse
+from letta.schemas.agent import AgentState, AgentStepResponse, UpdateAgent
 from letta.schemas.block import BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import MessageRole
 from letta.schemas.memory import ContextWindowOverview, Memory
-from letta.schemas.message import Message, UpdateMessage
+from letta.schemas.message import Message, MessageUpdate
 from letta.schemas.openai.chat_completion_request import (
     Tool as ChatCompletionRequestTool,
 )
@@ -44,14 +41,16 @@ from letta.schemas.openai.chat_completion_response import (
     Message as ChatCompletionMessage,
 )
 from letta.schemas.openai.chat_completion_response import UsageStatistics
-from letta.schemas.passage import Passage
 from letta.schemas.tool import Tool
 from letta.schemas.tool_rule import TerminalToolRule
 from letta.schemas.usage import LettaUsageStatistics
+from letta.schemas.user import User as PydanticUser
+from letta.services.agent_manager import AgentManager
 from letta.services.block_manager import BlockManager
+from letta.services.message_manager import MessageManager
+from letta.services.passage_manager import PassageManager
 from letta.services.source_manager import SourceManager
 from letta.services.tool_execution_sandbox import ToolExecutionSandbox
-from letta.services.user_manager import UserManager
 from letta.streaming_interface import StreamingRefreshCLIInterface
 from letta.system import (
     get_heartbeat,
@@ -79,9 +78,11 @@ from letta.utils import (
 
 
 def compile_memory_metadata_block(
+    actor: PydanticUser,
+    agent_id: str,
     memory_edit_timestamp: datetime.datetime,
-    archival_memory: Optional[ArchivalMemory] = None,
-    recall_memory: Optional[RecallMemory] = None,
+    agent_manager: Optional[AgentManager] = None,
+    message_manager: Optional[MessageManager] = None,
 ) -> str:
     # Put the timestamp in the local timezone (mimicking get_local_time())
     timestamp_str = memory_edit_timestamp.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z%z").strip()
@@ -90,8 +91,8 @@ def compile_memory_metadata_block(
     memory_metadata_block = "\n".join(
         [
             f"### Memory [last modified: {timestamp_str}]",
-            f"{recall_memory.count() if recall_memory else 0} previous messages between you and the user are stored in recall memory (use functions to access them)",
-            f"{archival_memory.count() if archival_memory else 0} total memories you created are stored in archival memory (use functions to access them)",
+            f"{message_manager.size(actor=actor, agent_id=agent_id) if message_manager else 0} previous messages between you and the user are stored in recall memory (use functions to access them)",
+            f"{agent_manager.passage_size(actor=actor, agent_id=agent_id) if agent_manager else 0} total memories you created are stored in archival memory (use functions to access them)",
             "\nCore memory shown below (limited in size, additional information stored in archival / recall memory):",
         ]
     )
@@ -100,10 +101,12 @@ def compile_memory_metadata_block(
 
 def compile_system_message(
     system_prompt: str,
+    agent_id: str,
     in_context_memory: Memory,
     in_context_memory_last_edit: datetime.datetime,  # TODO move this inside of BaseMemory?
-    archival_memory: Optional[ArchivalMemory] = None,
-    recall_memory: Optional[RecallMemory] = None,
+    actor: PydanticUser,
+    agent_manager: Optional[AgentManager] = None,
+    message_manager: Optional[MessageManager] = None,
     user_defined_variables: Optional[dict] = None,
     append_icm_if_missing: bool = True,
     template_format: Literal["f-string", "mustache", "jinja2"] = "f-string",
@@ -128,9 +131,11 @@ def compile_system_message(
     else:
         # TODO should this all put into the memory.__repr__ function?
         memory_metadata_string = compile_memory_metadata_block(
+            actor=actor,
+            agent_id=agent_id,
             memory_edit_timestamp=in_context_memory_last_edit,
-            archival_memory=archival_memory,
-            recall_memory=recall_memory,
+            agent_manager=agent_manager,
+            message_manager=message_manager,
         )
         full_memory_string = memory_metadata_string + "\n" + in_context_memory.compile()
 
@@ -163,9 +168,11 @@ def compile_system_message(
 def initialize_message_sequence(
     model: str,
     system: str,
+    agent_id: str,
     memory: Memory,
-    archival_memory: Optional[ArchivalMemory] = None,
-    recall_memory: Optional[RecallMemory] = None,
+    actor: PydanticUser,
+    agent_manager: Optional[AgentManager] = None,
+    message_manager: Optional[MessageManager] = None,
     memory_edit_timestamp: Optional[datetime.datetime] = None,
     include_initial_boot_message: bool = True,
 ) -> List[dict]:
@@ -173,14 +180,16 @@ def initialize_message_sequence(
         memory_edit_timestamp = get_local_time()
 
     # full_system_message = construct_system_with_memory(
-    # system, memory, memory_edit_timestamp, archival_memory=archival_memory, recall_memory=recall_memory
+    # system, memory, memory_edit_timestamp, agent_manager=agent_manager, recall_memory=recall_memory
     # )
     full_system_message = compile_system_message(
+        agent_id=agent_id,
         system_prompt=system,
         in_context_memory=memory,
         in_context_memory_last_edit=memory_edit_timestamp,
-        archival_memory=archival_memory,
-        recall_memory=recall_memory,
+        actor=actor,
+        agent_manager=agent_manager,
+        message_manager=message_manager,
         user_defined_variables=None,
         append_icm_if_missing=True,
     )
@@ -281,7 +290,9 @@ class Agent(BaseAgent):
         self.interface = interface
 
         # Create the persistence manager object based on the AgentState info
-        self.persistence_manager = LocalStateManager(agent_state=self.agent_state)
+        self.message_manager = MessageManager()
+        self.passage_manager = PassageManager()
+        self.agent_manager = AgentManager()
 
         # State needed for heartbeat pausing
         self.pause_heartbeats_start = None
@@ -302,15 +313,17 @@ class Agent(BaseAgent):
 
         else:
             printd(f"Agent.__init__ :: creating, state={agent_state.message_ids}")
-            assert self.agent_state.id is not None and self.agent_state.user_id is not None
+            assert self.agent_state.id is not None and self.agent_state.created_by_id is not None
 
             # Generate a sequence of initial messages to put in the buffer
             init_messages = initialize_message_sequence(
                 model=self.model,
                 system=self.agent_state.system,
+                agent_id=self.agent_state.id,
                 memory=self.agent_state.memory,
-                archival_memory=None,
-                recall_memory=None,
+                actor=self.user,
+                agent_manager=None,
+                message_manager=None,
                 memory_edit_timestamp=get_utc_time(),
                 include_initial_boot_message=True,
             )
@@ -319,7 +332,7 @@ class Agent(BaseAgent):
                 # We always need the system prompt up front
                 system_message_obj = Message.dict_to_message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=init_messages[0],
                 )
@@ -332,15 +345,17 @@ class Agent(BaseAgent):
                     model=self.model,
                     system=self.agent_state.system,
                     memory=self.agent_state.memory,
-                    archival_memory=None,
-                    recall_memory=None,
+                    agent_id=self.agent_state.id,
+                    actor=self.user,
+                    agent_manager=None,
+                    message_manager=None,
                     memory_edit_timestamp=get_utc_time(),
                     include_initial_boot_message=True,
                 )
                 # Cast to Message objects
                 init_messages = [
                     Message.dict_to_message(
-                        agent_id=self.agent_state.id, user_id=self.agent_state.user_id, model=self.model, openai_message_dict=msg
+                        agent_id=self.agent_state.id, user_id=self.agent_state.created_by_id, model=self.model, openai_message_dict=msg
                     )
                     for msg in init_messages
                 ]
@@ -349,11 +364,12 @@ class Agent(BaseAgent):
             init_messages_objs = []
             for msg in init_messages:
                 init_messages_objs.append(msg)
+            for msg in init_messages_objs:
+                assert isinstance(msg, Message), f"Message object is not of type Message: {type(msg)}"
             assert all([isinstance(msg, Message) for msg in init_messages_objs]), (init_messages_objs, init_messages)
 
             # Put the messages inside the message buffer
             self.messages_total = 0
-            # self._append_to_messages(added_messages=[cast(Message, msg) for msg in init_messages_objs if msg is not None])
             self._append_to_messages(added_messages=init_messages_objs)
             self._validate_message_buffer_is_utc()
 
@@ -410,18 +426,22 @@ class Agent(BaseAgent):
         # TODO: need to have an AgentState object that actually has full access to the block data
         # this is because the sandbox tools need to be able to access block.value to edit this data
         try:
-            if function_name in BASE_TOOLS:
+            # TODO: This is NO BUENO
+            # TODO: Matching purely by names is extremely problematic, users can create tools with these names and run them in the agent loop
+            # TODO: We will have probably have to match the function strings exactly for safety
+            if function_name in BASE_TOOLS or function_name in O1_BASE_TOOLS:
                 # base tools are allowed to access the `Agent` object and run on the database
                 function_args["self"] = self  # need to attach self to arg since it's dynamically linked
                 function_response = function_to_call(**function_args)
             else:
                 # execute tool in a sandbox
                 # TODO: allow agent_state to specify which sandbox to execute tools in
-                sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.agent_state.user_id).run(
+                sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.agent_state.created_by_id).run(
                     agent_state=self.agent_state.__deepcopy__()
                 )
                 function_response, updated_agent_state = sandbox_run_result.func_return, sandbox_run_result.agent_state
                 assert orig_memory_str == self.agent_state.memory.compile(), "Memory should not be modified in a sandbox tool"
+
                 self.update_memory_if_change(updated_agent_state.memory)
         except Exception as e:
             # Need to catch error here, or else trunction wont happen
@@ -455,10 +475,10 @@ class Agent(BaseAgent):
         for tool in tools:
             try:
                 # WARNING: name may not be consistent?
-                if tool.module:  # execute the whole module
-                    exec(tool.module, env)
-                else:
-                    exec(tool.source_code, env)
+                # if tool.module:  # execute the whole module
+                #    exec(tool.module, env)
+                # else:
+                exec(tool.source_code, env)
                 self.functions_python[tool.json_schema["name"]] = env[tool.json_schema["name"]]
                 self.functions.append(tool.json_schema)
             except Exception:
@@ -471,7 +491,7 @@ class Agent(BaseAgent):
         # Pull the message objects from the database
         message_objs = []
         for msg_id in message_ids:
-            msg_obj = self.persistence_manager.recall_memory.storage.get(msg_id)
+            msg_obj = self.message_manager.get_message_by_id(msg_id, actor=self.user)
             if msg_obj:
                 if isinstance(msg_obj, Message):
                     message_objs.append(msg_obj)
@@ -490,9 +510,10 @@ class Agent(BaseAgent):
         for m in self._messages:
             # assert is_utc_datetime(m.created_at), f"created_at on message for agent {self.agent_state.name} isn't UTC:\n{vars(m)}"
             # TODO eventually do casting via an edit_message function
-            if not is_utc_datetime(m.created_at):
-                printd(f"Warning - created_at on message for agent {self.agent_state.name} isn't UTC (text='{m.text}')")
-                m.created_at = m.created_at.replace(tzinfo=datetime.timezone.utc)
+            if m.created_at:
+                if not is_utc_datetime(m.created_at):
+                    printd(f"Warning - created_at on message for agent {self.agent_state.name} isn't UTC (text='{m.text}')")
+                    m.created_at = m.created_at.replace(tzinfo=datetime.timezone.utc)
 
     def set_message_buffer(self, message_ids: List[str], force_utc: bool = True):
         """Set the messages in the buffer to the message IDs list"""
@@ -519,16 +540,13 @@ class Agent(BaseAgent):
 
     def _trim_messages(self, num):
         """Trim messages from the front, not including the system message"""
-        self.persistence_manager.trim_messages(num)
-
         new_messages = [self._messages[0]] + self._messages[num:]
         self._messages = new_messages
 
     def _prepend_to_messages(self, added_messages: List[Message]):
         """Wrapper around self.messages.prepend to allow additional calls to a state/persistence manager"""
         assert all([isinstance(msg, Message) for msg in added_messages])
-
-        self.persistence_manager.prepend_to_messages(added_messages)
+        self.message_manager.create_many_messages(added_messages, actor=self.user)
 
         new_messages = [self._messages[0]] + added_messages + self._messages[1:]  # prepend (no system)
         self._messages = new_messages
@@ -537,8 +555,7 @@ class Agent(BaseAgent):
     def _append_to_messages(self, added_messages: List[Message]):
         """Wrapper around self.messages.append to allow additional calls to a state/persistence manager"""
         assert all([isinstance(msg, Message) for msg in added_messages])
-
-        self.persistence_manager.append_to_messages(added_messages)
+        self.message_manager.create_many_messages(added_messages, actor=self.user)
 
         # strip extra metadata if it exists
         # for msg in added_messages:
@@ -554,7 +571,7 @@ class Agent(BaseAgent):
         added_messages_objs = [
             Message.dict_to_message(
                 agent_id=self.agent_state.id,
-                user_id=self.agent_state.user_id,
+                user_id=self.agent_state.created_by_id,
                 model=self.model,
                 openai_message_dict=msg,
             )
@@ -566,60 +583,60 @@ class Agent(BaseAgent):
         self,
         message_sequence: List[Message],
         function_call: str = "auto",
-        first_message: bool = False,  # hint
+        first_message: bool = False,
         stream: bool = False,  # TODO move to config?
-        fail_on_empty_response: bool = False,
         empty_response_retry_limit: int = 3,
+        backoff_factor: float = 0.5,  # delay multiplier for exponential backoff
+        max_delay: float = 10.0,  # max delay between retries
     ) -> ChatCompletionResponse:
-        """Get response from LLM API"""
-        # Get the allowed tools based on the ToolRulesSolver state
+        """Get response from LLM API with robust retry mechanism."""
+
         allowed_tool_names = self.tool_rules_solver.get_allowed_tool_names()
+        allowed_functions = (
+            self.functions if not allowed_tool_names else [func for func in self.functions if func["name"] in allowed_tool_names]
+        )
 
-        if not allowed_tool_names:
-            # if it's empty, any available tools are fair game
-            allowed_functions = self.functions
-        else:
-            allowed_functions = [func for func in self.functions if func["name"] in allowed_tool_names]
+        for attempt in range(1, empty_response_retry_limit + 1):
+            try:
+                response = create(
+                    llm_config=self.agent_state.llm_config,
+                    messages=message_sequence,
+                    user_id=self.agent_state.created_by_id,
+                    functions=allowed_functions,
+                    functions_python=self.functions_python,
+                    function_call=function_call,
+                    first_message=first_message,
+                    stream=stream,
+                    stream_interface=self.interface,
+                )
 
-        try:
-            response = create(
-                # agent_state=self.agent_state,
-                llm_config=self.agent_state.llm_config,
-                messages=message_sequence,
-                user_id=self.agent_state.user_id,
-                functions=allowed_functions,
-                functions_python=self.functions_python,
-                function_call=function_call,
-                # hint
-                first_message=first_message,
-                # streaming
-                stream=stream,
-                stream_interface=self.interface,
-            )
+                # These bottom two are retryable
+                if len(response.choices) == 0 or response.choices[0] is None:
+                    raise ValueError(f"API call returned an empty message: {response}")
 
-            if len(response.choices) == 0 or response.choices[0] is None:
-                empty_api_err_message = f"API call didn't return a message: {response}"
-                if fail_on_empty_response or empty_response_retry_limit == 0:
-                    raise Exception(empty_api_err_message)
+                if response.choices[0].finish_reason not in ["stop", "function_call", "tool_calls"]:
+                    if response.choices[0].finish_reason == "length":
+                        # This is not retryable, hence RuntimeError v.s. ValueError
+                        raise RuntimeError("Finish reason was length (maximum context length)")
+                    else:
+                        raise ValueError(f"Bad finish reason from API: {response.choices[0].finish_reason}")
+
+                return response
+
+            except ValueError as ve:
+                if attempt >= empty_response_retry_limit:
+                    warnings.warn(f"Retry limit reached. Final error: {ve}")
+                    break
                 else:
-                    # Decrement retry limit and try again
-                    warnings.warn(empty_api_err_message)
-                    return self._get_ai_reply(
-                        message_sequence, function_call, first_message, stream, fail_on_empty_response, empty_response_retry_limit - 1
-                    )
+                    delay = min(backoff_factor * (2 ** (attempt - 1)), max_delay)
+                    warnings.warn(f"Attempt {attempt} failed: {ve}. Retrying in {delay} seconds...")
+                    time.sleep(delay)
 
-            # special case for 'length'
-            if response.choices[0].finish_reason == "length":
-                raise Exception("Finish reason was length (maximum context length)")
+            except Exception as e:
+                # For non-retryable errors, exit immediately
+                raise e
 
-            # catches for soft errors
-            if response.choices[0].finish_reason not in ["stop", "function_call", "tool_calls"]:
-                raise Exception(f"API call finish with bad finish reason: {response}")
-
-            # unpack with response.choices[0].message.content
-            return response
-        except Exception as e:
-            raise e
+        raise Exception("Retries exhausted and no valid response received.")
 
     def _handle_ai_response(
         self,
@@ -670,7 +687,7 @@ class Agent(BaseAgent):
                 Message.dict_to_message(
                     id=response_message_id,
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=response_message.model_dump(),
                 )
@@ -703,7 +720,7 @@ class Agent(BaseAgent):
                 messages.append(
                     Message.dict_to_message(
                         agent_id=self.agent_state.id,
-                        user_id=self.agent_state.user_id,
+                        user_id=self.agent_state.created_by_id,
                         model=self.model,
                         openai_message_dict={
                             "role": "tool",
@@ -726,7 +743,7 @@ class Agent(BaseAgent):
                 messages.append(
                     Message.dict_to_message(
                         agent_id=self.agent_state.id,
-                        user_id=self.agent_state.user_id,
+                        user_id=self.agent_state.created_by_id,
                         model=self.model,
                         openai_message_dict={
                             "role": "tool",
@@ -782,7 +799,13 @@ class Agent(BaseAgent):
                     # but by default, we add a truncation safeguard to prevent bad functions from
                     # overflow the agent context window
                     truncate = True
-                function_response_string = validate_function_response(function_response, truncate=truncate)
+
+                # get the function response limit
+                tool_obj = [tool for tool in self.agent_state.tools if tool.name == function_name][0]
+                return_char_limit = tool_obj.return_char_limit
+                function_response_string = validate_function_response(
+                    function_response, return_char_limit=return_char_limit, truncate=truncate
+                )
                 function_args.pop("self", None)
                 function_response = package_function_response(True, function_response_string)
                 function_failed = False
@@ -798,7 +821,7 @@ class Agent(BaseAgent):
                 messages.append(
                     Message.dict_to_message(
                         agent_id=self.agent_state.id,
-                        user_id=self.agent_state.user_id,
+                        user_id=self.agent_state.created_by_id,
                         model=self.model,
                         openai_message_dict={
                             "role": "tool",
@@ -817,7 +840,7 @@ class Agent(BaseAgent):
             messages.append(
                 Message.dict_to_message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict={
                         "role": "tool",
@@ -836,7 +859,7 @@ class Agent(BaseAgent):
                 Message.dict_to_message(
                     id=response_message_id,
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=response_message.model_dump(),
                 )
@@ -865,24 +888,19 @@ class Agent(BaseAgent):
         # additional args
         chaining: bool = True,
         max_chaining_steps: Optional[int] = None,
-        ms: Optional[MetadataStore] = None,
         **kwargs,
     ) -> LettaUsageStatistics:
         """Run Agent.step in a loop, handling chaining via heartbeat requests and function failures"""
-        # assert ms is not None, "MetadataStore is required"
-
         next_input_message = messages if isinstance(messages, list) else [messages]
         counter = 0
         total_usage = UsageStatistics()
         step_count = 0
         while True:
-            kwargs["ms"] = ms
             kwargs["first_message"] = False
             step_response = self.inner_step(
                 messages=next_input_message,
                 **kwargs,
             )
-            step_response.messages
             heartbeat_request = step_response.heartbeat_request
             function_failed = step_response.function_failed
             token_warning = step_response.in_context_memory_warning
@@ -895,8 +913,7 @@ class Agent(BaseAgent):
 
             # logger.debug("Saving agent state")
             # save updated state
-            if ms:
-                save_agent(self, ms)
+            save_agent(self)
 
             # Chain stops
             if not chaining:
@@ -907,10 +924,10 @@ class Agent(BaseAgent):
                 break
             # Chain handlers
             elif token_warning:
-                assert self.agent_state.user_id is not None
+                assert self.agent_state.created_by_id is not None
                 next_input_message = Message.dict_to_message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict={
                         "role": "user",  # TODO: change to system?
@@ -919,10 +936,10 @@ class Agent(BaseAgent):
                 )
                 continue  # always chain
             elif function_failed:
-                assert self.agent_state.user_id is not None
+                assert self.agent_state.created_by_id is not None
                 next_input_message = Message.dict_to_message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict={
                         "role": "user",  # TODO: change to system?
@@ -931,10 +948,10 @@ class Agent(BaseAgent):
                 )
                 continue  # always chain
             elif heartbeat_request:
-                assert self.agent_state.user_id is not None
+                assert self.agent_state.created_by_id is not None
                 next_input_message = Message.dict_to_message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict={
                         "role": "user",  # TODO: change to system?
@@ -955,7 +972,6 @@ class Agent(BaseAgent):
         first_message_retry_limit: int = FIRST_MESSAGE_ATTEMPTS,
         skip_verify: bool = False,
         stream: bool = False,  # TODO move to config?
-        ms: Optional[MetadataStore] = None,
     ) -> AgentStepResponse:
         """Runs a single step in the agent loop (generates at most one LLM call)"""
 
@@ -1075,7 +1091,6 @@ class Agent(BaseAgent):
                     first_message_retry_limit=first_message_retry_limit,
                     skip_verify=skip_verify,
                     stream=stream,
-                    ms=ms,
                 )
 
             else:
@@ -1105,10 +1120,10 @@ class Agent(BaseAgent):
         openai_message_dict = {"role": "user", "content": cleaned_user_message_text, "name": name}
 
         # Create the associated Message object (in the database)
-        assert self.agent_state.user_id is not None, "User ID is not set"
+        assert self.agent_state.created_by_id is not None, "User ID is not set"
         user_message = Message.dict_to_message(
             agent_id=self.agent_state.id,
-            user_id=self.agent_state.user_id,
+            user_id=self.agent_state.created_by_id,
             model=self.model,
             openai_message_dict=openai_message_dict,
             # created_at=timestamp,
@@ -1208,7 +1223,7 @@ class Agent(BaseAgent):
             [
                 Message.dict_to_message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
+                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=packed_summary_message,
                 )
@@ -1236,7 +1251,7 @@ class Agent(BaseAgent):
         assert isinstance(new_system_message, str)
         new_system_message_obj = Message.dict_to_message(
             agent_id=self.agent_state.id,
-            user_id=self.agent_state.user_id,
+            user_id=self.agent_state.created_by_id,
             model=self.model,
             openai_message_dict={"role": "system", "content": new_system_message},
         )
@@ -1244,14 +1259,28 @@ class Agent(BaseAgent):
         assert new_system_message_obj.role == "system", new_system_message_obj
         assert self._messages[0].role == "system", self._messages
 
-        self.persistence_manager.swap_system_message(new_system_message_obj)
+        self.message_manager.create_message(new_system_message_obj, actor=self.user)
 
         new_messages = [new_system_message_obj] + self._messages[1:]  # swap index 0 (system)
         self._messages = new_messages
 
     def rebuild_system_prompt(self, force=False, update_timestamp=True):
-        """Rebuilds the system message with the latest memory object and any shared memory block updates"""
+        """Rebuilds the system message with the latest memory object and any shared memory block updates
+
+        Updates to core memory blocks should trigger a "rebuild", which itself will create a new message object
+
+        Updates to the memory header should *not* trigger a rebuild, since that will simply flood recall storage with excess messages
+        """
+
         curr_system_message = self.messages[0]  # this is the system + memory bank, not just the system prompt
+
+        # note: we only update the system prompt if the core memory is changed
+        # this means that the archival/recall memory statistics may be someout out of date
+        curr_memory_str = self.agent_state.memory.compile()
+        if curr_memory_str in curr_system_message["content"] and not force:
+            # NOTE: could this cause issues if a block is removed? (substring match would still work)
+            printd(f"Memory hasn't changed, skipping system prompt rebuild")
+            return
 
         # If the memory didn't update, we probably don't want to update the timestamp inside
         # For example, if we're doing a system prompt swap, this should probably be False
@@ -1261,13 +1290,15 @@ class Agent(BaseAgent):
             # NOTE: a bit of a hack - we pull the timestamp from the message created_by
             memory_edit_timestamp = self._messages[0].created_at
 
-        # update memory (TODO: potentially update recall/archival stats seperately)
+        # update memory (TODO: potentially update recall/archival stats separately)
         new_system_message_str = compile_system_message(
+            agent_id=self.agent_state.id,
             system_prompt=self.agent_state.system,
             in_context_memory=self.agent_state.memory,
             in_context_memory_last_edit=memory_edit_timestamp,
-            archival_memory=self.persistence_manager.archival_memory,
-            recall_memory=self.persistence_manager.recall_memory,
+            actor=self.user,
+            agent_manager=self.agent_manager,
+            message_manager=self.message_manager,
             user_defined_variables=None,
             append_icm_if_missing=True,
         )
@@ -1331,77 +1362,36 @@ class Agent(BaseAgent):
         # TODO: recall memory
         raise NotImplementedError()
 
-    def attach_source(self, source_id: str, source_connector: StorageConnector, ms: MetadataStore):
-        """Attach data with name `source_name` to the agent from source_connector."""
-        # TODO: eventually, adding a data source should just give access to the retriever the source table, rather than modifying archival memory
-        user = UserManager().get_user_by_id(self.agent_state.user_id)
-        filters = {"user_id": self.agent_state.user_id, "source_id": source_id}
-        size = source_connector.size(filters)
-        page_size = 100
-        generator = source_connector.get_all_paginated(filters=filters, page_size=page_size)  # yields List[Passage]
-        all_passages = []
-        for i in tqdm(range(0, size, page_size)):
-            passages = next(generator)
+    def attach_source(
+        self,
+        user: PydanticUser,
+        source_id: str,
+        source_manager: SourceManager,
+        agent_manager: AgentManager,
+    ):
+        """Attach a source to the agent using the SourcesAgents ORM relationship.
+ 
+        Args:
+            user: User performing the action
+            source_id: ID of the source to attach
+            source_manager: SourceManager instance to verify source exists
+            agent_manager: AgentManager instance to manage agent-source relationship
+        """
+        # Verify source exists and user has permission to access it
+        source = source_manager.get_source_by_id(source_id=source_id, actor=user)
+        assert source is not None, f"Source {source_id} not found in user's organization ({user.organization_id})"
 
-            # need to associated passage with agent (for filtering)
-            for passage in passages:
-                assert isinstance(passage, Passage), f"Generate yielded bad non-Passage type: {type(passage)}"
-                passage.agent_id = self.agent_state.id
-
-                # regenerate passage ID (avoid duplicates)
-                # TODO: need to find another solution to the text duplication issue
-                # passage.id = create_uuid_from_string(f"{source_id}_{str(passage.agent_id)}_{passage.text}")
-
-            # insert into agent archival memory
-            self.persistence_manager.archival_memory.storage.insert_many(passages)
-            all_passages += passages
-
-        assert size == len(all_passages), f"Expected {size} passages, but only got {len(all_passages)}"
-
-        # save destination storage
-        self.persistence_manager.archival_memory.storage.save()
-
-        # attach to agent
-        source = SourceManager().get_source_by_id(source_id=source_id, actor=user)
-        assert source is not None, f"Source {source_id} not found in metadata store"
-        ms.attach_source(agent_id=self.agent_state.id, source_id=source_id, user_id=self.agent_state.user_id)
-
-        total_agent_passages = self.persistence_manager.archival_memory.storage.size()
+        # Use the agent_manager to create the relationship
+        agent_manager.attach_source(agent_id=self.agent_state.id, source_id=source_id, actor=user)
 
         printd(
-            f"Attached data source {source.name} to agent {self.agent_state.name}, consisting of {len(all_passages)}. Agent now has {total_agent_passages} embeddings in archival memory.",
+            f"Attached data source {source.name} to agent {self.agent_state.name}.",
         )
 
-    def update_message(self, request: UpdateMessage) -> Message:
+    def update_message(self, message_id: str, request: MessageUpdate) -> Message:
         """Update the details of a message associated with an agent"""
-
-        message = self.persistence_manager.recall_memory.storage.get(id=request.id)
-        if message is None:
-            raise ValueError(f"Message with id {request.id} not found")
-        assert isinstance(message, Message), f"Message is not a Message object: {type(message)}"
-
-        # Override fields
-        # NOTE: we try to do some sanity checking here (see asserts), but it's not foolproof
-        if request.role:
-            message.role = request.role
-        if request.text:
-            message.text = request.text
-        if request.name:
-            message.name = request.name
-        if request.tool_calls:
-            assert message.role == MessageRole.assistant, "Tool calls can only be added to assistant messages"
-            message.tool_calls = request.tool_calls
-        if request.tool_call_id:
-            assert message.role == MessageRole.tool, "tool_call_id can only be added to tool messages"
-            message.tool_call_id = request.tool_call_id
-
         # Save the updated message
-        self.persistence_manager.recall_memory.storage.update(record=message)
-
-        # Return the updated message
-        updated_message = self.persistence_manager.recall_memory.storage.get(id=message.id)
-        if updated_message is None:
-            raise ValueError(f"Error persisting message - message with id {request.id} not found")
+        updated_message = self.message_manager.update_message_by_id(message_id=message_id, message_update=request, actor=self.user)
         return updated_message
 
     # TODO(sarah): should we be creating a new message here, or just editing a message?
@@ -1411,10 +1401,10 @@ class Agent(BaseAgent):
             msg_obj = self._messages[x]
             if msg_obj.role == MessageRole.assistant:
                 updated_message = self.update_message(
-                    request=UpdateMessage(
-                        id=msg_obj.id,
+                    message_id=msg_obj.id,
+                    request=MessageUpdate(
                         text=new_thought,
-                    )
+                    ),
                 )
                 self.refresh_message_buffer()
                 return updated_message
@@ -1453,10 +1443,10 @@ class Agent(BaseAgent):
 
                     # Write the update to the DB
                     updated_message = self.update_message(
-                        request=UpdateMessage(
-                            id=message_obj.id,
+                        message_id=message_obj.id,
+                        request=MessageUpdate(
                             tool_calls=message_obj.tool_calls,
-                        )
+                        ),
                     )
                     self.refresh_message_buffer()
                     return updated_message
@@ -1479,7 +1469,7 @@ class Agent(BaseAgent):
                 deleted_message = self._messages.pop()
                 # then also remove it from recall storage
                 try:
-                    self.persistence_manager.recall_memory.storage.delete(filters={"id": deleted_message.id})
+                    self.message_manager.delete_message_by_id(deleted_message.id, actor=self.user)
                     popped_messages.append(deleted_message)
                 except Exception as e:
                     warnings.warn(f"Error deleting message {deleted_message.id} from recall memory: {e}")
@@ -1505,7 +1495,6 @@ class Agent(BaseAgent):
 
     def retry_message(self) -> List[Message]:
         """Retry / regenerate the last message"""
-
         self.pop_until_user()
         user_message = self.pop_message(count=1)[0]
         assert user_message.text is not None, "User message text is None"
@@ -1552,12 +1541,14 @@ class Agent(BaseAgent):
                 num_tokens_from_messages(messages=messages_openai_format[1:], model=self.model) if len(messages_openai_format) > 1 else 0
             )
 
-        num_archival_memory = self.persistence_manager.archival_memory.storage.size()
-        num_recall_memory = self.persistence_manager.recall_memory.storage.size()
+        agent_manager_passage_size = self.agent_manager.passage_size(actor=self.user, agent_id=self.agent_state.id)
+        message_manager_size = self.message_manager.size(actor=self.user, agent_id=self.agent_state.id)
         external_memory_summary = compile_memory_metadata_block(
+            actor=self.user,
+            agent_id=self.agent_state.id,
             memory_edit_timestamp=get_utc_time(),  # dummy timestamp
-            archival_memory=self.persistence_manager.archival_memory,
-            recall_memory=self.persistence_manager.recall_memory,
+            agent_manager=self.agent_manager,
+            message_manager=self.message_manager,
         )
         num_tokens_external_memory_summary = count_tokens(external_memory_summary)
 
@@ -1582,8 +1573,8 @@ class Agent(BaseAgent):
         return ContextWindowOverview(
             # context window breakdown (in messages)
             num_messages=len(self._messages),
-            num_archival_memory=num_archival_memory,
-            num_recall_memory=num_recall_memory,
+            num_archival_memory=agent_manager_passage_size,
+            num_recall_memory=message_manager_size,
             num_tokens_external_memory_summary=num_tokens_external_memory_summary,
             # top-level information
             context_window_size_max=self.agent_state.llm_config.context_window,
@@ -1608,20 +1599,31 @@ class Agent(BaseAgent):
         return context_window_breakdown.context_window_size_current
 
 
-def save_agent(agent: Agent, ms: MetadataStore):
+def save_agent(agent: Agent):
     """Save agent to metadata store"""
-
     agent.update_state()
     agent_state = agent.agent_state
     assert isinstance(agent_state.memory, Memory), f"Memory is not a Memory object: {type(agent_state.memory)}"
 
     # TODO: move this to agent manager
+    # TODO: Completely strip out metadata
     # convert to persisted model
-    persisted_agent_state = agent.agent_state.to_persisted_agent_state()
-    if ms.get_agent(agent_id=persisted_agent_state.id):
-        ms.update_agent(persisted_agent_state)
-    else:
-        ms.create_agent(persisted_agent_state)
+    agent_manager = AgentManager()
+    update_agent = UpdateAgent(
+        name=agent_state.name,
+        tool_ids=[t.id for t in agent_state.tools],
+        source_ids=[s.id for s in agent_state.sources],
+        block_ids=[b.id for b in agent_state.memory.blocks],
+        tags=agent_state.tags,
+        system=agent_state.system,
+        tool_rules=agent_state.tool_rules,
+        llm_config=agent_state.llm_config,
+        embedding_config=agent_state.embedding_config,
+        message_ids=agent_state.message_ids,
+        description=agent_state.description,
+        metadata_=agent_state.metadata_,
+    )
+    agent_manager.update_agent(agent_id=agent_state.id, agent_update=update_agent, actor=agent.user)
 
 
 def strip_name_field_from_user_message(user_message_text: str) -> Tuple[str, Optional[str]]:

@@ -10,10 +10,14 @@ import letta.utils as utils
 from letta import create_client
 from letta.agent import Agent, save_agent
 from letta.config import LettaConfig
-from letta.constants import CLI_WARNING_PREFIX, LETTA_DIR, MIN_CONTEXT_WINDOW
+from letta.constants import (
+    CLI_WARNING_PREFIX,
+    CORE_MEMORY_BLOCK_CHAR_LIMIT,
+    LETTA_DIR,
+    MIN_CONTEXT_WINDOW,
+)
 from letta.local_llm.constants import ASSISTANT_MESSAGE_CLI_SYMBOL
 from letta.log import get_logger
-from letta.metadata import MetadataStore
 from letta.schemas.enums import OptionState
 from letta.schemas.memory import ChatMemory, Memory
 from letta.server.server import logger as server_logger
@@ -46,8 +50,9 @@ def server(
     port: Annotated[Optional[int], typer.Option(help="Port to run the server on")] = None,
     host: Annotated[Optional[str], typer.Option(help="Host to run the server on (default to localhost)")] = None,
     debug: Annotated[bool, typer.Option(help="Turn debugging output on")] = False,
-    ade: Annotated[bool, typer.Option(help="Allows remote access")] = False,
+    ade: Annotated[bool, typer.Option(help="Allows remote access")] = False,  # NOTE: deprecated
     secure: Annotated[bool, typer.Option(help="Adds simple security access")] = False,
+    localhttps: Annotated[bool, typer.Option(help="Setup local https")] = False,
 ):
     """Launch a Letta server process"""
     if type == ServerChoice.rest_api:
@@ -91,7 +96,7 @@ def run(
     ] = None,
     core_memory_limit: Annotated[
         Optional[int], typer.Option(help="The character limit to each core-memory section (human/persona).")
-    ] = 2000,
+    ] = CORE_MEMORY_BLOCK_CHAR_LIMIT,
     # other
     first: Annotated[bool, typer.Option(help="Use --first to send the first message in the sequence")] = False,
     strip_ui: Annotated[bool, typer.Option(help="Remove all the bells and whistles in CLI output (helpful for testing)")] = False,
@@ -132,9 +137,7 @@ def run(
     config = LettaConfig.load()
 
     # read user id from config
-    ms = MetadataStore(config)
     client = create_client()
-    server = client.server
 
     # determine agent to use, if not provided
     if not yes and not agent:
@@ -159,14 +162,11 @@ def run(
     persona = persona if persona else config.persona
     if agent and agent_state:  # use existing agent
         typer.secho(f"\n🔁 Using existing agent {agent}", fg=typer.colors.GREEN)
-        # agent_config = AgentConfig.load(agent)
-        # agent_state = ms.get_agent(agent_name=agent, user_id=user_id)
         printd("Loading agent state:", agent_state.id)
         printd("Agent state:", agent_state.name)
         # printd("State path:", agent_config.save_state_dir())
         # printd("Persistent manager path:", agent_config.save_persistence_manager_dir())
         # printd("Index path:", agent_config.save_agent_index_dir())
-        # persistence_manager = LocalStateManager(agent_config).load() # TODO: implement load
         # TODO: load prior agent state
 
         # Allow overriding model specifics (model, model wrapper, model endpoint IP + type, context_window)
@@ -219,8 +219,7 @@ def run(
         )
 
         # create agent
-        tools = [server.tool_manager.get_tool_by_name(tool_name=tool_name, actor=client.user) for tool_name in agent_state.tool_names]
-        letta_agent = Agent(agent_state=agent_state, interface=interface(), tools=tools, user=client.user)
+        letta_agent = Agent(agent_state=agent_state, interface=interface(), user=client.user)
 
     else:  # create new agent
         # create new agent config: override defaults with args if provided
@@ -311,7 +310,7 @@ def run(
             metadata=metadata,
         )
         assert isinstance(agent_state.memory, Memory), f"Expected Memory, got {type(agent_state.memory)}"
-        typer.secho(f"->  🛠️  {len(agent_state.tools)} tools: {', '.join([t for t in agent_state.tool_names])}", fg=typer.colors.WHITE)
+        typer.secho(f"->  🛠️  {len(agent_state.tools)} tools: {', '.join([t.name for t in agent_state.tools])}", fg=typer.colors.WHITE)
 
         letta_agent = Agent(
             interface=interface(),
@@ -320,7 +319,7 @@ def run(
             first_message_verify_mono=True if (model is not None and "gpt-4" in model) else False,
             user=client.user,
         )
-        save_agent(agent=letta_agent, ms=ms)
+        save_agent(agent=letta_agent)
         typer.secho(f"🎉 Created new agent '{letta_agent.agent_state.name}' (id={letta_agent.agent_state.id})", fg=typer.colors.GREEN)
 
     # start event loop
@@ -331,7 +330,6 @@ def run(
         letta_agent=letta_agent,
         config=config,
         first=first,
-        ms=ms,
         no_verify=no_verify,
         stream=stream,
     )  # TODO: add back no_verify
@@ -366,8 +364,7 @@ def delete_agent(
         sys.exit(1)
 
 
-def version():
+def version() -> str:
     import letta
 
-    print(letta.__version__)
     return letta.__version__

@@ -3,10 +3,11 @@ import json
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from letta.schemas.agent import AgentState
 from letta.schemas.letta_base import LettaBase, OrmMetadataBase
+from letta.settings import tool_settings
 
 
 # Sandbox Config
@@ -19,11 +20,17 @@ class SandboxRunResult(BaseModel):
     func_return: Optional[Any] = Field(None, description="The function return object")
     agent_state: Optional[AgentState] = Field(None, description="The agent state")
     stdout: Optional[List[str]] = Field(None, description="Captured stdout (e.g. prints, logs) from the function invocation")
+    stderr: Optional[List[str]] = Field(None, description="Captured stderr from the function invocation")
     sandbox_config_fingerprint: str = Field(None, description="The fingerprint of the config for the sandbox")
 
 
 class LocalSandboxConfig(BaseModel):
     sandbox_dir: str = Field(..., description="Directory for the sandbox environment.")
+    use_venv: bool = Field(False, description="Whether or not to use the venv, or run directly in the same run loop.")
+    venv_name: str = Field(
+        "venv",
+        description="The name for the venv in the sandbox directory. We first search for an existing venv with this name, otherwise, we make it from the requirements.txt.",
+    )
 
     @property
     def type(self) -> "SandboxType":
@@ -38,6 +45,16 @@ class E2BSandboxConfig(BaseModel):
     @property
     def type(self) -> "SandboxType":
         return SandboxType.E2B
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_default_template(cls, data: dict):
+        """
+        Assign a default template value if the template field is not provided.
+        """
+        if data.get("template") is None:
+            data["template"] = tool_settings.e2b_sandbox_template_id
+        return data
 
 
 class SandboxConfigBase(OrmMetadataBase):

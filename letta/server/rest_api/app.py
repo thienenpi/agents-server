@@ -1,17 +1,21 @@
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 from letta.__init__ import __version__
 from letta.constants import ADMIN_PREFIX, API_PREFIX, OPENAI_API_PREFIX
+from letta.errors import LettaAgentNotFoundError, LettaUserNotFoundError
+from letta.log import get_logger
+from letta.orm.errors import NoResultFound
 from letta.schemas.letta_response import LettaResponse
 from letta.server.constants import REST_DEFAULT_PORT
 
@@ -22,9 +26,6 @@ from letta.server.rest_api.auth.index import (
 from letta.server.rest_api.interface import StreamingServerInterface
 from letta.server.rest_api.routers.openai.assistants.assistants import (
     router as openai_assistants_router,
-)
-from letta.server.rest_api.routers.openai.assistants.threads import (
-    router as openai_threads_router,
 )
 from letta.server.rest_api.routers.openai.chat_completions.chat_completions import (
     router as openai_chat_completions_router,
@@ -46,6 +47,7 @@ from letta.settings import settings
 # NOTE(charles): @ethan I had to add this to get the global as the bottom to work
 interface: StreamingServerInterface = StreamingServerInterface
 server = SyncServer(default_interface_factory=lambda: interface())
+logger = get_logger(__name__)
 
 # TODO: remove
 password = None
@@ -103,11 +105,17 @@ def generate_password():
     return secrets.token_urlsafe(16)
 
 
-random_password = generate_password()
+random_password = os.getenv("LETTA_SERVER_PASSWORD") or generate_password()
 
 
 class CheckPasswordMiddleware(BaseHTTPMiddleware):
+
     async def dispatch(self, request, call_next):
+
+        # Exclude health check endpoint from password protection
+        if request.url.path == "/v1/health/" or request.url.path == "/latest/health/":
+            return await call_next(request)
+
         if request.headers.get("X-BARE-PASSWORD") == f"password {random_password}":
             return await call_next(request)
 
@@ -123,20 +131,73 @@ def create_application() -> "FastAPI":
     # server = SyncServer(default_interface_factory=lambda: interface())
     print(f"\n[[ Letta server // v{__version__} ]]")
 
+    if (os.getenv("SENTRY_DSN") is not None) and (os.getenv("SENTRY_DSN") != ""):
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=os.getenv("SENTRY_DSN"),
+            traces_sample_rate=1.0,
+            _experiments={
+                "continuous_profiling_auto_start": True,
+            },
+        )
+
+    debug_mode = "--debug" in sys.argv
     app = FastAPI(
         swagger_ui_parameters={"docExpansion": "none"},
         # openapi_tags=TAGS_METADATA,
         title="Letta",
         summary="Create LLM agents with long-term memory and custom tools 📚🦙",
         version="1.0.0",  # TODO wire this up to the version in the package
-        debug=True,
+        debug=debug_mode,  # if True, the stack trace will be printed in the response
     )
 
-    if "--ade" in sys.argv:
-        settings.cors_origins.append("https://app.letta.com")
-        print(f"▶ View using ADE at: https://app.letta.com/local-project/agents")
+    @app.exception_handler(Exception)
+    async def generic_error_handler(request: Request, exc: Exception):
+        # Log the actual error for debugging
+        log.error(f"Unhandled error: {exc}", exc_info=True)
 
-    if "--secure" in sys.argv:
+        # Print the stack trace
+        print(f"Stack trace: {exc.__traceback__}")
+        if (os.getenv("SENTRY_DSN") is not None) and (os.getenv("SENTRY_DSN") != ""):
+            import sentry_sdk
+
+            sentry_sdk.capture_exception(exc)
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "An internal server error occurred",
+                # Only include error details in debug/development mode
+                # "debug_info": str(exc) if settings.debug else None
+            },
+        )
+
+    @app.exception_handler(NoResultFound)
+    async def no_result_found_handler(request: Request, exc: NoResultFound):
+        logger.error(f"NoResultFound request: {request}")
+        logger.error(f"NoResultFound: {exc}")
+
+        return JSONResponse(
+            status_code=404,
+            content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(ValueError)
+    async def value_error_handler(request: Request, exc: ValueError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(LettaAgentNotFoundError)
+    async def agent_not_found_handler(request: Request, exc: LettaAgentNotFoundError):
+        return JSONResponse(status_code=404, content={"detail": "Agent not found"})
+
+    @app.exception_handler(LettaUserNotFoundError)
+    async def user_not_found_handler(request: Request, exc: LettaUserNotFoundError):
+        return JSONResponse(status_code=404, content={"detail": "User not found"})
+
+    settings.cors_origins.append("https://app.letta.com")
+
+    if (os.getenv("LETTA_SERVER_SECURE") == "true") or "--secure" in sys.argv:
         print(f"▶ Using secure mode with password: {random_password}")
         app.add_middleware(CheckPasswordMiddleware)
 
@@ -164,7 +225,6 @@ def create_application() -> "FastAPI":
 
     # openai
     app.include_router(openai_assistants_router, prefix=OPENAI_API_PREFIX)
-    app.include_router(openai_threads_router, prefix=OPENAI_API_PREFIX)
     app.include_router(openai_chat_completions_router, prefix=OPENAI_API_PREFIX)
 
     # /api/auth endpoints
@@ -185,7 +245,6 @@ def create_application() -> "FastAPI":
     @app.on_event("shutdown")
     def on_shutdown():
         global server
-        server.save_agents()
         # server = None
 
     return app
@@ -213,9 +272,21 @@ def start_server(
         # Add the handler to the logger
         server_logger.addHandler(stream_handler)
 
-    print(f"▶ Server running at: http://{host or 'localhost'}:{port or REST_DEFAULT_PORT}\n")
-    uvicorn.run(
-        app,
-        host=host or "localhost",
-        port=port or REST_DEFAULT_PORT,
-    )
+    if (os.getenv("LOCAL_HTTPS") == "true") or "--localhttps" in sys.argv:
+        uvicorn.run(
+            app,
+            host=host or "localhost",
+            port=port or REST_DEFAULT_PORT,
+            ssl_keyfile="certs/localhost-key.pem",
+            ssl_certfile="certs/localhost.pem",
+        )
+        print(f"▶ Server running at: https://{host or 'localhost'}:{port or REST_DEFAULT_PORT}\n")
+    else:
+        uvicorn.run(
+            app,
+            host=host or "localhost",
+            port=port or REST_DEFAULT_PORT,
+        )
+        print(f"▶ Server running at: http://{host or 'localhost'}:{port or REST_DEFAULT_PORT}\n")
+
+    print(f"▶ View using ADE at: https://app.letta.com/development-servers/local/dashboard")
