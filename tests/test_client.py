@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import threading
 import time
@@ -15,7 +16,7 @@ from letta.schemas.agent import AgentState
 from letta.schemas.block import CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.job import JobStatus
-from letta.schemas.letta_message import FunctionReturn
+from letta.schemas.letta_message import ToolReturnMessage
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.sandbox_config import LocalSandboxConfig, SandboxType
 from letta.utils import create_random_username
@@ -365,12 +366,12 @@ def test_function_return_limit(client: Union[LocalClient, RESTClient]):
 
     response_message = None
     for message in response.messages:
-        if isinstance(message, FunctionReturn):
+        if isinstance(message, ToolReturnMessage):
             response_message = message
             break
 
-    assert response_message, "FunctionReturn message not found in response"
-    res = response_message.function_return
+    assert response_message, "ToolReturnMessage message not found in response"
+    res = response_message.tool_return
     assert "function output was truncated " in res
 
     # TODO: Re-enable later
@@ -378,6 +379,39 @@ def test_function_return_limit(client: Union[LocalClient, RESTClient]):
     # assert (
     #     len(res_json["message"]) <= 1000 + padding
     # ), f"Expected length to be less than or equal to 1000 + {padding}, but got {len(res_json['message'])}"
+
+    client.delete_agent(agent_id=agent.id)
+
+
+def test_function_always_error(client: Union[LocalClient, RESTClient]):
+    """Test to see if function that errors works correctly"""
+
+    def always_error():
+        """
+        Always throw an error.
+        """
+        return 5/0
+
+    tool = client.create_or_update_tool(func=always_error)
+    agent = client.create_agent(tool_ids=[tool.id])
+    # get function response
+    response = client.send_message(agent_id=agent.id, message="call the always_error function", role="user")
+    print(response.messages)
+
+    response_message = None
+    for message in response.messages:
+        if isinstance(message, ToolReturnMessage):
+            response_message = message
+            break
+
+    assert response_message, "ToolReturnMessage message not found in response"
+    assert response_message.status == "error"
+    if isinstance(client, RESTClient):
+        assert response_message.tool_return == "Error executing function always_error: ZeroDivisionError: division by zero"
+    else:
+        response_json = json.loads(response_message.tool_return)
+        assert response_json['status'] == "Failed"
+        assert response_json['message'] == "Error executing function always_error: ZeroDivisionError: division by zero"
 
     client.delete_agent(agent_id=agent.id)
 

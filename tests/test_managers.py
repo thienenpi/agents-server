@@ -2,28 +2,27 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from httpx._transports import default
-from numpy import source
 import pytest
 from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 
 from letta.config import LettaConfig
+from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS
 from letta.embeddings import embedding_model
 from letta.functions.functions import derive_openai_json_schema, parse_source_code
 from letta.orm import (
     Agent,
+    AgentPassage,
     Block,
     BlocksAgents,
     FileMetadata,
     Job,
     Message,
     Organization,
-    AgentPassage,
-    SourcePassage,
     SandboxConfig,
     SandboxEnvironmentVariable,
     Source,
+    SourcePassage,
     SourcesAgents,
     Tool,
     ToolsAgents,
@@ -202,9 +201,9 @@ def agent_passage_fixture(server: SyncServer, default_user, sarah_agent):
             organization_id=default_user.organization_id,
             embedding=[0.1],
             embedding_config=DEFAULT_EMBEDDING_CONFIG,
-            metadata_={"type": "test"}
+            metadata_={"type": "test"},
         ),
-        actor=default_user
+        actor=default_user,
     )
     yield passage
 
@@ -220,9 +219,9 @@ def source_passage_fixture(server: SyncServer, default_user, default_file, defau
             organization_id=default_user.organization_id,
             embedding=[0.1],
             embedding_config=DEFAULT_EMBEDDING_CONFIG,
-            metadata_={"type": "test"}
+            metadata_={"type": "test"},
         ),
-        actor=default_user
+        actor=default_user,
     )
     yield passage
 
@@ -240,9 +239,9 @@ def create_test_passages(server: SyncServer, default_file, default_user, sarah_a
                 organization_id=default_user.organization_id,
                 embedding=[0.1],
                 embedding_config=DEFAULT_EMBEDDING_CONFIG,
-                metadata_={"type": "test"}
+                metadata_={"type": "test"},
             ),
-            actor=default_user
+            actor=default_user,
         )
         passages.append(passage)
         if USING_SQLITE:
@@ -258,9 +257,9 @@ def create_test_passages(server: SyncServer, default_file, default_user, sarah_a
                 organization_id=default_user.organization_id,
                 embedding=[0.1],
                 embedding_config=DEFAULT_EMBEDDING_CONFIG,
-                metadata_={"type": "test"}
+                metadata_={"type": "test"},
             ),
-            actor=default_user
+            actor=default_user,
         )
         passages.append(passage)
         if USING_SQLITE:
@@ -371,8 +370,8 @@ def other_tool(server: SyncServer, default_user, default_organization):
 @pytest.fixture
 def sarah_agent(server: SyncServer, default_user, default_organization):
     """Fixture to create and return a sample agent within the default organization."""
-    agent_state = server.create_agent(
-        request=CreateAgent(
+    agent_state = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
             name="sarah_agent",
             memory_blocks=[],
             llm_config=LLMConfig.default_config("gpt-4"),
@@ -386,8 +385,8 @@ def sarah_agent(server: SyncServer, default_user, default_organization):
 @pytest.fixture
 def charles_agent(server: SyncServer, default_user, default_organization):
     """Fixture to create and return a sample agent within the default organization."""
-    agent_state = server.create_agent(
-        request=CreateAgent(
+    agent_state = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
             name="charles_agent",
             memory_blocks=[CreateBlock(label="human", value="Charles"), CreateBlock(label="persona", value="I am a helpful assistant")],
             llm_config=LLMConfig.default_config("gpt-4"),
@@ -452,7 +451,7 @@ def agent_passages_setup(server, default_source, default_user, sarah_agent):
                 embedding=[0.1],  # Default OpenAI embedding size
                 embedding_config=DEFAULT_EMBEDDING_CONFIG,
             ),
-            actor=actor
+            actor=actor,
         )
         source_passages.append(passage)
 
@@ -467,7 +466,7 @@ def agent_passages_setup(server, default_source, default_user, sarah_agent):
                 embedding=[0.1],  # Default OpenAI embedding size
                 embedding_config=DEFAULT_EMBEDDING_CONFIG,
             ),
-            actor=actor
+            actor=actor,
         )
         agent_passages.append(passage)
 
@@ -475,6 +474,7 @@ def agent_passages_setup(server, default_source, default_user, sarah_agent):
 
     # Cleanup
     server.source_manager.delete_source(default_source.id, actor=actor)
+
 
 # ======================================================================================================================
 # AgentManager Tests - Basic
@@ -501,6 +501,54 @@ def test_create_get_list_agent(server: SyncServer, comprehensive_test_agent_fixt
     server.agent_manager.delete_agent(get_agent.id, default_user)
     list_agents = server.agent_manager.list_agents(actor=default_user)
     assert len(list_agents) == 0
+
+
+def test_create_agent_passed_in_initial_messages(server: SyncServer, default_user, default_block):
+    memory_blocks = [CreateBlock(label="human", value="BananaBoy"), CreateBlock(label="persona", value="I am a helpful assistant")]
+    create_agent_request = CreateAgent(
+        system="test system",
+        memory_blocks=memory_blocks,
+        llm_config=LLMConfig.default_config("gpt-4"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        block_ids=[default_block.id],
+        tags=["a", "b"],
+        description="test_description",
+        initial_message_sequence=[MessageCreate(role=MessageRole.user, text="hello world")],
+    )
+    agent_state = server.agent_manager.create_agent(
+        create_agent_request,
+        actor=default_user,
+    )
+    assert server.message_manager.size(agent_id=agent_state.id, actor=default_user) == 2
+    init_messages = server.agent_manager.get_in_context_messages(agent_id=agent_state.id, actor=default_user)
+    # Check that the system appears in the first initial message
+    assert create_agent_request.system in init_messages[0].text
+    assert create_agent_request.memory_blocks[0].value in init_messages[0].text
+    # Check that the second message is the passed in initial message seq
+    assert create_agent_request.initial_message_sequence[0].role == init_messages[1].role
+    assert create_agent_request.initial_message_sequence[0].text in init_messages[1].text
+
+
+def test_create_agent_default_initial_message(server: SyncServer, default_user, default_block):
+    memory_blocks = [CreateBlock(label="human", value="BananaBoy"), CreateBlock(label="persona", value="I am a helpful assistant")]
+    create_agent_request = CreateAgent(
+        system="test system",
+        memory_blocks=memory_blocks,
+        llm_config=LLMConfig.default_config("gpt-4"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        block_ids=[default_block.id],
+        tags=["a", "b"],
+        description="test_description",
+    )
+    agent_state = server.agent_manager.create_agent(
+        create_agent_request,
+        actor=default_user,
+    )
+    assert server.message_manager.size(agent_id=agent_state.id, actor=default_user) == 4
+    init_messages = server.agent_manager.get_in_context_messages(agent_id=agent_state.id, actor=default_user)
+    # Check that the system appears in the first initial message
+    assert create_agent_request.system in init_messages[0].text
+    assert create_agent_request.memory_blocks[0].value in init_messages[0].text
 
 
 def test_update_agent(server: SyncServer, comprehensive_test_agent_fixture, other_tool, other_source, other_block, default_user):
@@ -794,8 +842,8 @@ def test_list_agents_by_tags_with_other_filters(server: SyncServer, sarah_agent,
 def test_list_agents_by_tags_pagination(server: SyncServer, default_user, default_organization):
     """Test pagination when listing agents by tags."""
     # Create first agent
-    agent1 = server.create_agent(
-        request=CreateAgent(
+    agent1 = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
             name="agent1",
             tags=["pagination_test", "tag1"],
             llm_config=LLMConfig.default_config("gpt-4"),
@@ -809,8 +857,8 @@ def test_list_agents_by_tags_pagination(server: SyncServer, default_user, defaul
         time.sleep(CREATE_DELAY_SQLITE)  # Ensure distinct created_at timestamps
 
     # Create second agent
-    agent2 = server.create_agent(
-        request=CreateAgent(
+    agent2 = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
             name="agent2",
             tags=["pagination_test", "tag2"],
             llm_config=LLMConfig.default_config("gpt-4"),
@@ -940,32 +988,33 @@ def test_get_block_with_label(server: SyncServer, sarah_agent, default_block, de
 # Agent Manager - Passages Tests
 # ======================================================================================================================
 
+
 def test_agent_list_passages_basic(server, default_user, sarah_agent, agent_passages_setup):
     """Test basic listing functionality of agent passages"""
-    
+
     all_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id)
     assert len(all_passages) == 5  # 3 source + 2 agent passages
 
 
 def test_agent_list_passages_ordering(server, default_user, sarah_agent, agent_passages_setup):
-    """Test ordering of agent passages""" 
+    """Test ordering of agent passages"""
 
     # Test ascending order
     asc_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, ascending=True)
     assert len(asc_passages) == 5
     for i in range(1, len(asc_passages)):
-        assert asc_passages[i-1].created_at <= asc_passages[i].created_at
+        assert asc_passages[i - 1].created_at <= asc_passages[i].created_at
 
     # Test descending order
     desc_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, ascending=False)
     assert len(desc_passages) == 5
     for i in range(1, len(desc_passages)):
-        assert desc_passages[i-1].created_at >= desc_passages[i].created_at
+        assert desc_passages[i - 1].created_at >= desc_passages[i].created_at
 
 
 def test_agent_list_passages_pagination(server, default_user, sarah_agent, agent_passages_setup):
     """Test pagination of agent passages"""
-    
+
     # Test limit
     limited_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, limit=3)
     assert len(limited_passages) == 3
@@ -973,13 +1022,9 @@ def test_agent_list_passages_pagination(server, default_user, sarah_agent, agent
     # Test cursor-based pagination
     first_page = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, limit=2, ascending=True)
     assert len(first_page) == 2
-    
+
     second_page = server.agent_manager.list_passages(
-        actor=default_user,
-        agent_id=sarah_agent.id,
-        cursor=first_page[-1].id,
-        limit=2,
-        ascending=True
+        actor=default_user, agent_id=sarah_agent.id, cursor=first_page[-1].id, limit=2, ascending=True
     )
     assert len(second_page) == 2
     assert first_page[-1].id != second_page[0].id
@@ -988,57 +1033,38 @@ def test_agent_list_passages_pagination(server, default_user, sarah_agent, agent
 
 def test_agent_list_passages_text_search(server, default_user, sarah_agent, agent_passages_setup):
     """Test text search functionality of agent passages"""
-    
+
     # Test text search for source passages
-    source_text_passages = server.agent_manager.list_passages(
-        actor=default_user,
-        agent_id=sarah_agent.id,
-        query_text="Source passage"
-    )
+    source_text_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, query_text="Source passage")
     assert len(source_text_passages) == 3
 
     # Test text search for agent passages
-    agent_text_passages = server.agent_manager.list_passages(
-        actor=default_user,
-        agent_id=sarah_agent.id,
-        query_text="Agent passage"
-    )
+    agent_text_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, query_text="Agent passage")
     assert len(agent_text_passages) == 2
 
 
 def test_agent_list_passages_agent_only(server, default_user, sarah_agent, agent_passages_setup):
     """Test text search functionality of agent passages"""
-    
+
     # Test text search for agent passages
-    agent_text_passages = server.agent_manager.list_passages(
-        actor=default_user,
-        agent_id=sarah_agent.id,
-        agent_only=True
-    )
+    agent_text_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, agent_only=True)
     assert len(agent_text_passages) == 2
 
 
 def test_agent_list_passages_filtering(server, default_user, sarah_agent, default_source, agent_passages_setup):
     """Test filtering functionality of agent passages"""
-    
+
     # Test source filtering
-    source_filtered = server.agent_manager.list_passages(
-        actor=default_user,
-        agent_id=sarah_agent.id,
-        source_id=default_source.id
-    )
+    source_filtered = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, source_id=default_source.id)
     assert len(source_filtered) == 3
 
     # Test date filtering
     now = datetime.utcnow()
     future_date = now + timedelta(days=1)
     past_date = now - timedelta(days=1)
-    
+
     date_filtered = server.agent_manager.list_passages(
-        actor=default_user,
-        agent_id=sarah_agent.id,
-        start_date=past_date,
-        end_date=future_date
+        actor=default_user, agent_id=sarah_agent.id, start_date=past_date, end_date=future_date
     )
     assert len(date_filtered) == 5
 
@@ -1049,7 +1075,7 @@ def test_agent_list_passages_vector_search(server, default_user, sarah_agent, de
 
     # Create passages with known embeddings
     passages = []
-    
+
     # Create passages with different embeddings
     test_passages = [
         "I like red",
@@ -1058,7 +1084,7 @@ def test_agent_list_passages_vector_search(server, default_user, sarah_agent, de
     ]
 
     server.agent_manager.attach_source(agent_id=sarah_agent.id, source_id=default_source.id, actor=default_user)
-    
+
     for i, text in enumerate(test_passages):
         embedding = embed_model.get_text_embedding(text)
         if i % 2 == 0:
@@ -1067,7 +1093,7 @@ def test_agent_list_passages_vector_search(server, default_user, sarah_agent, de
                 organization_id=default_user.organization_id,
                 agent_id=sarah_agent.id,
                 embedding_config=DEFAULT_EMBEDDING_CONFIG,
-                embedding=embedding
+                embedding=embedding,
             )
         else:
             passage = PydanticPassage(
@@ -1075,14 +1101,14 @@ def test_agent_list_passages_vector_search(server, default_user, sarah_agent, de
                 organization_id=default_user.organization_id,
                 source_id=default_source.id,
                 embedding_config=DEFAULT_EMBEDDING_CONFIG,
-                embedding=embedding
+                embedding=embedding,
             )
         created_passage = server.passage_manager.create_passage(passage, default_user)
         passages.append(created_passage)
 
     # Query vector similar to "red" embedding
     query_key = "What's my favorite color?"
-    
+
     # Test vector search with all passages
     results = server.agent_manager.list_passages(
         actor=default_user,
@@ -1091,7 +1117,7 @@ def test_agent_list_passages_vector_search(server, default_user, sarah_agent, de
         embedding_config=DEFAULT_EMBEDDING_CONFIG,
         embed_query=True,
     )
-    
+
     # Verify results are ordered by similarity
     assert len(results) == 3
     assert results[0].text == "I like red"
@@ -1105,9 +1131,9 @@ def test_agent_list_passages_vector_search(server, default_user, sarah_agent, de
         query_text=query_key,
         embedding_config=DEFAULT_EMBEDDING_CONFIG,
         embed_query=True,
-        agent_only=True
+        agent_only=True,
     )
-    
+
     # Verify agent-only results
     assert len(agent_only_results) == 2
     assert agent_only_results[0].text == "I like red"
@@ -1116,7 +1142,7 @@ def test_agent_list_passages_vector_search(server, default_user, sarah_agent, de
 
 def test_list_source_passages_only(server: SyncServer, default_user, default_source, agent_passages_setup):
     """Test listing passages from a source without specifying an agent."""
-    
+
     # List passages by source_id without agent_id
     source_passages = server.agent_manager.list_passages(
         actor=default_user,
@@ -1180,6 +1206,7 @@ def test_list_organizations_pagination(server: SyncServer):
 # Passage Manager Tests
 # ======================================================================================================================
 
+
 def test_passage_create_agentic(server: SyncServer, agent_passage_fixture, default_user):
     """Test creating a passage using agent_passage_fixture fixture"""
     assert agent_passage_fixture.id is not None
@@ -1214,7 +1241,7 @@ def test_passage_create_invalid(server: SyncServer, agent_passage_fixture, defau
     """Test creating an agent passage."""
     assert agent_passage_fixture is not None
     assert agent_passage_fixture.text == "Hello, I am an agent passage"
-    
+
     # Try to create an invalid passage (with both agent_id and source_id)
     with pytest.raises(AssertionError):
         server.passage_manager.create_passage(
@@ -1226,7 +1253,7 @@ def test_passage_create_invalid(server: SyncServer, agent_passage_fixture, defau
                 embedding=[0.1] * 1024,
                 embedding_config=DEFAULT_EMBEDDING_CONFIG,
             ),
-            actor=default_user
+            actor=default_user,
         )
 
 
@@ -1243,19 +1270,21 @@ def test_passage_get_by_id(server: SyncServer, agent_passage_fixture, source_pas
     assert retrieved.text == source_passage_fixture.text
 
 
-def test_passage_cascade_deletion(server: SyncServer, agent_passage_fixture, source_passage_fixture, default_user, default_source, sarah_agent):
+def test_passage_cascade_deletion(
+    server: SyncServer, agent_passage_fixture, source_passage_fixture, default_user, default_source, sarah_agent
+):
     """Test that passages are deleted when their parent (agent or source) is deleted."""
     # Verify passages exist
     agent_passage = server.passage_manager.get_passage_by_id(agent_passage_fixture.id, default_user)
     source_passage = server.passage_manager.get_passage_by_id(source_passage_fixture.id, default_user)
     assert agent_passage is not None
     assert source_passage is not None
-    
+
     # Delete agent and verify its passages are deleted
     server.agent_manager.delete_agent(sarah_agent.id, default_user)
     agentic_passages = server.agent_manager.list_passages(actor=default_user, agent_id=sarah_agent.id, agent_only=True)
     assert len(agentic_passages) == 0
-    
+
     # Delete source and verify its passages are deleted
     server.source_manager.delete_source(default_source.id, default_user)
     with pytest.raises(NoResultFound):
@@ -1318,7 +1347,6 @@ def test_create_tool(server: SyncServer, print_tool, default_user, default_organ
     # Assertions to ensure the created tool matches the expected values
     assert print_tool.created_by_id == default_user.id
     assert print_tool.organization_id == default_organization.id
-
 
 
 @pytest.mark.skipif(USING_SQLITE, reason="Test not applicable when using SQLite.")
@@ -1481,6 +1509,16 @@ def test_delete_tool_by_id(server: SyncServer, print_tool, default_user):
     assert len(tools) == 0
 
 
+def test_upsert_base_tools(server: SyncServer, default_user):
+    tools = server.tool_manager.upsert_base_tools(actor=default_user)
+    expected_tool_names = sorted(BASE_TOOLS + BASE_MEMORY_TOOLS)
+    assert sorted([t.name for t in tools]) == expected_tool_names
+
+    # Call it again to make sure it doesn't create duplicates
+    tools = server.tool_manager.upsert_base_tools(actor=default_user)
+    assert sorted([t.name for t in tools]) == expected_tool_names
+
+
 # ======================================================================================================================
 # Message Manager Tests
 # ======================================================================================================================
@@ -1573,6 +1611,15 @@ def create_test_messages(server: SyncServer, base_message: PydanticMessage, defa
     ]
     server.message_manager.create_many_messages(messages, actor=default_user)
     return messages
+
+
+def test_get_messages_by_ids(server: SyncServer, hello_world_message_fixture, default_user, sarah_agent):
+    """Test basic message listing with limit"""
+    messages = create_test_messages(server, hello_world_message_fixture, default_user)
+    message_ids = [m.id for m in messages]
+
+    results = server.message_manager.get_messages_by_ids(message_ids=message_ids, actor=default_user)
+    assert sorted(message_ids) == sorted([r.id for r in results])
 
 
 def test_message_listing_basic(server: SyncServer, hello_world_message_fixture, default_user, sarah_agent):
@@ -1889,6 +1936,7 @@ def test_update_source_no_changes(server: SyncServer, default_user):
 # Source Manager Tests - Files
 # ======================================================================================================================
 
+
 def test_get_file_by_id(server: SyncServer, default_user, default_source):
     """Test retrieving a file by ID."""
     file_metadata = PydanticFileMetadata(
@@ -1959,6 +2007,7 @@ def test_delete_file(server: SyncServer, default_user, default_source):
 # ======================================================================================================================
 # SandboxConfigManager Tests - Sandbox Configs
 # ======================================================================================================================
+
 
 def test_create_or_update_sandbox_config(server: SyncServer, default_user):
     sandbox_config_create = SandboxConfigCreate(
@@ -2039,6 +2088,7 @@ def test_list_sandbox_configs(server: SyncServer, default_user):
 # SandboxConfigManager Tests - Environment Variables
 # ======================================================================================================================
 
+
 def test_create_sandbox_env_var(server: SyncServer, sandbox_config_fixture, default_user):
     env_var_create = SandboxEnvironmentVariableCreate(key="TEST_VAR", value="test_value", description="A test environment variable.")
     created_env_var = server.sandbox_config_manager.create_sandbox_env_var(
@@ -2110,6 +2160,7 @@ def test_get_sandbox_env_var_by_key(server: SyncServer, sandbox_env_var_fixture,
 # ======================================================================================================================
 # JobManager Tests
 # ======================================================================================================================
+
 
 def test_create_job(server: SyncServer, default_user):
     """Test creating a job."""

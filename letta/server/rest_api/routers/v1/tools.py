@@ -1,13 +1,15 @@
 from typing import List, Optional
 
+from composio.client import ComposioClientError, HTTPError, NoItemsFound
 from composio.client.collections import ActionModel, AppModel
 from composio.client.enums.base import EnumStringNotFound
-from composio.exceptions import ComposioSDKError
+from composio.exceptions import ApiKeyNotProvidedError, ComposioSDKError
+from composio.tools.base.abs import InvalidClassDefinition
 from fastapi import APIRouter, Body, Depends, Header, HTTPException
 
 from letta.errors import LettaToolCreateError
 from letta.orm.errors import UniqueConstraintViolationError
-from letta.schemas.letta_message import FunctionReturn
+from letta.schemas.letta_message import ToolReturnMessage
 from letta.schemas.tool import Tool, ToolCreate, ToolRunFromSource, ToolUpdate
 from letta.schemas.user import User
 from letta.server.rest_api.utils import get_letta_server
@@ -152,33 +154,18 @@ def update_tool(
 
 
 @router.post("/add-base-tools", response_model=List[Tool], operation_id="add_base_tools")
-def add_base_tools(
+def upsert_base_tools(
     server: SyncServer = Depends(get_letta_server),
     user_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
     """
-    Add base tools
+    Upsert base tools
     """
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.tool_manager.add_base_tools(actor=actor)
+    return server.tool_manager.upsert_base_tools(actor=actor)
 
 
-# NOTE: can re-enable if needed
-# @router.post("/{tool_id}/run", response_model=FunctionReturn, operation_id="run_tool")
-# def run_tool(
-#     server: SyncServer = Depends(get_letta_server),
-#     request: ToolRun = Body(...),
-#     user_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
-# ):
-#     """
-#     Run an existing tool on provided arguments
-#     """
-#     actor = server.user_manager.get_user_or_default(user_id=user_id)
-
-#     return server.run_tool(tool_id=request.tool_id, tool_args=request.tool_args, user_id=actor.id)
-
-
-@router.post("/run", response_model=FunctionReturn, operation_id="run_tool_from_source")
+@router.post("/run", response_model=ToolReturnMessage, operation_id="run_tool_from_source")
 def run_tool_from_source(
     server: SyncServer = Depends(get_letta_server),
     request: ToolRunFromSource = Body(...),
@@ -195,7 +182,7 @@ def run_tool_from_source(
             tool_source_type=request.source_type,
             tool_args=request.args,
             tool_name=request.name,
-            user_id=actor.id,
+            actor=actor,
         )
     except LettaToolCreateError as e:
         # HTTP 400 == Bad Request
@@ -254,19 +241,66 @@ def add_composio_tool(
     try:
         tool_create = ToolCreate.from_composio(action_name=composio_action_name, api_key=composio_api_key)
         return server.tool_manager.create_or_update_tool(pydantic_tool=Tool(**tool_create.model_dump()), actor=actor)
-    except EnumStringNotFound:
+    except EnumStringNotFound as e:
         raise HTTPException(
             status_code=400,  # Bad Request
             detail={
-                "message": f"Cannot find composio action with name `{composio_action_name}`.",
+                "code": "EnumStringNotFound",
+                "message": str(e),
                 "composio_action_name": composio_action_name,
             },
         )
-    except ComposioSDKError:
+    except HTTPError as e:
         raise HTTPException(
             status_code=400,  # Bad Request
             detail={
-                "message": f"No connected account found for tool `{composio_action_name}`. You need to connect the relevant app in Composio order to use the tool.",
+                "code": "HTTPError",
+                "message": str(e),
+                "composio_action_name": composio_action_name,
+            },
+        )
+    except NoItemsFound as e:
+        raise HTTPException(
+            status_code=400,  # Bad Request
+            detail={
+                "code": "NoItemsFound",
+                "message": str(e),
+                "composio_action_name": composio_action_name,
+            },
+        )
+    except ComposioClientError as e:
+        raise HTTPException(
+            status_code=400,  # Bad Request
+            detail={
+                "code": "ComposioClientError",
+                "message": str(e),
+                "composio_action_name": composio_action_name,
+            },
+        )
+    except ApiKeyNotProvidedError as e:
+        raise HTTPException(
+            status_code=400,  # Bad Request
+            detail={
+                "code": "ApiKeyNotProvidedError",
+                "message": str(e),
+                "composio_action_name": composio_action_name,
+            },
+        )
+    except InvalidClassDefinition as e:
+        raise HTTPException(
+            status_code=400,  # Bad Request
+            detail={
+                "code": "InvalidClassDefinition",
+                "message": str(e),
+                "composio_action_name": composio_action_name,
+            },
+        )
+    except ComposioSDKError as e:
+        raise HTTPException(
+            status_code=400,  # Bad Request
+            detail={
+                "code": "ComposioSDKError",
+                "message": str(e),
                 "composio_action_name": composio_action_name,
             },
         )

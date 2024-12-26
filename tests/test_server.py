@@ -10,21 +10,20 @@ from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS
 from letta.schemas.block import CreateBlock
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_message import (
-    FunctionCallMessage,
-    FunctionReturn,
-    InternalMonologue,
     LettaMessage,
+    ReasoningMessage,
     SystemMessage,
+    ToolCallMessage,
+    ToolReturnMessage,
     UserMessage,
 )
 from letta.schemas.user import User
 
 utils.DEBUG = True
 from letta.config import LettaConfig
-from letta.schemas.agent import CreateAgent
+from letta.schemas.agent import CreateAgent, UpdateAgent
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.job import Job as PydanticJob
-from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message
 from letta.schemas.source import Source as PydanticSource
 from letta.server.server import SyncServer
@@ -289,15 +288,16 @@ def org_id(server):
 
 
 @pytest.fixture(scope="module")
-def user_id(server, org_id):
-    # create user
+def user(server, org_id):
     user = server.user_manager.create_default_user()
-    print(f"Created user\n{user.id}")
-
-    yield user.id
-
-    # cleanup
+    yield user
     server.user_manager.delete_user_by_id(user.id)
+
+
+@pytest.fixture(scope="module")
+def user_id(server, user):
+    # create user
+    yield user.id
 
 
 @pytest.fixture(scope="module")
@@ -329,8 +329,8 @@ def agent_id(server, user_id, base_tools):
             name="test_agent",
             tool_ids=[t.id for t in base_tools],
             memory_blocks=[],
-            llm_config=LLMConfig.default_config("gpt-4"),
-            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            llm="openai/gpt-4",
+            embedding="openai/text-embedding-ada-002",
         ),
         actor=actor,
     )
@@ -350,8 +350,8 @@ def other_agent_id(server, user_id, base_tools):
             name="test_agent_other",
             tool_ids=[t.id for t in base_tools],
             memory_blocks=[],
-            llm_config=LLMConfig.default_config("gpt-4"),
-            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            llm="openai/gpt-4",
+            embedding="openai/text-embedding-ada-002",
         ),
         actor=actor,
     )
@@ -362,10 +362,10 @@ def other_agent_id(server, user_id, base_tools):
     server.agent_manager.delete_agent(agent_state.id, actor=actor)
 
 
-def test_error_on_nonexistent_agent(server, user_id, agent_id):
+def test_error_on_nonexistent_agent(server, user, agent_id):
     try:
         fake_agent_id = str(uuid.uuid4())
-        server.user_message(user_id=user_id, agent_id=fake_agent_id, message="Hello?")
+        server.user_message(user_id=user.id, agent_id=fake_agent_id, message="Hello?")
         raise Exception("user_message call should have failed")
     except (KeyError, ValueError) as e:
         # Error is expected
@@ -375,9 +375,9 @@ def test_error_on_nonexistent_agent(server, user_id, agent_id):
 
 
 @pytest.mark.order(1)
-def test_user_message_memory(server, user_id, agent_id):
+def test_user_message_memory(server, user, agent_id):
     try:
-        server.user_message(user_id=user_id, agent_id=agent_id, message="/memory")
+        server.user_message(user_id=user.id, agent_id=agent_id, message="/memory")
         raise Exception("user_message call should have failed")
     except ValueError as e:
         # Error is expected
@@ -385,17 +385,13 @@ def test_user_message_memory(server, user_id, agent_id):
     except:
         raise
 
-    server.run_command(user_id=user_id, agent_id=agent_id, command="/memory")
+    server.run_command(user_id=user.id, agent_id=agent_id, command="/memory")
 
 
 @pytest.mark.order(3)
-def test_load_data(server, user_id, agent_id):
-    user = server.user_manager.get_user_or_default(user_id=user_id)
-
+def test_load_data(server, user, agent_id):
     # create source
-    passages_before = server.agent_manager.list_passages(
-        actor=user, agent_id=agent_id, cursor=None, limit=10000
-    )
+    passages_before = server.agent_manager.list_passages(actor=user, agent_id=agent_id, cursor=None, limit=10000)
     assert len(passages_before) == 0
 
     source = server.source_manager.create_source(
@@ -411,10 +407,10 @@ def test_load_data(server, user_id, agent_id):
         "Shishir loves indian food",
     ]
     connector = DummyDataConnector(archival_memories)
-    server.load_data(user_id, connector, source.name)
+    server.load_data(user.id, connector, source.name)
 
     # attach source
-    server.attach_source_to_agent(user_id=user_id, agent_id=agent_id, source_name="test_source")
+    server.agent_manager.attach_source(agent_id=agent_id, source_id=source.id, actor=user)
 
     # check archival memory size
     passages_after = server.agent_manager.list_passages(actor=user, agent_id=agent_id, cursor=None, limit=10000)
@@ -427,9 +423,9 @@ def test_save_archival_memory(server, user_id, agent_id):
 
 
 @pytest.mark.order(4)
-def test_user_message(server, user_id, agent_id):
+def test_user_message(server, user, agent_id):
     # add data into recall memory
-    server.user_message(user_id=user_id, agent_id=agent_id, message="Hello?")
+    server.user_message(user_id=user.id, agent_id=agent_id, message="Hello?")
     # server.user_message(user_id=user_id, agent_id=agent_id, message="Hello?")
     # server.user_message(user_id=user_id, agent_id=agent_id, message="Hello?")
     # server.user_message(user_id=user_id, agent_id=agent_id, message="Hello?")
@@ -437,21 +433,20 @@ def test_user_message(server, user_id, agent_id):
 
 
 @pytest.mark.order(5)
-def test_get_recall_memory(server, org_id, user_id, agent_id):
+def test_get_recall_memory(server, org_id, user, agent_id):
     # test recall memory cursor pagination
-    actor = server.user_manager.get_user_or_default(user_id=user_id)
-    messages_1 = server.get_agent_recall_cursor(user_id=user_id, agent_id=agent_id, limit=2)
+    actor = user
+    messages_1 = server.get_agent_recall_cursor(user_id=user.id, agent_id=agent_id, limit=2)
     cursor1 = messages_1[-1].id
-    messages_2 = server.get_agent_recall_cursor(user_id=user_id, agent_id=agent_id, after=cursor1, limit=1000)
-    messages_3 = server.get_agent_recall_cursor(user_id=user_id, agent_id=agent_id, limit=1000)
+    messages_2 = server.get_agent_recall_cursor(user_id=user.id, agent_id=agent_id, after=cursor1, limit=1000)
+    messages_3 = server.get_agent_recall_cursor(user_id=user.id, agent_id=agent_id, limit=1000)
     messages_3[-1].id
     assert messages_3[-1].created_at >= messages_3[0].created_at
     assert len(messages_3) == len(messages_1) + len(messages_2)
-    messages_4 = server.get_agent_recall_cursor(user_id=user_id, agent_id=agent_id, reverse=True, before=cursor1)
+    messages_4 = server.get_agent_recall_cursor(user_id=user.id, agent_id=agent_id, reverse=True, before=cursor1)
     assert len(messages_4) == 1
 
     # test in-context message ids
-    # in_context_ids = server.get_in_context_message_ids(agent_id=agent_id)
     in_context_ids = server.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
 
     message_ids = [m.id for m in messages_3]
@@ -460,13 +455,13 @@ def test_get_recall_memory(server, org_id, user_id, agent_id):
 
 
 @pytest.mark.order(6)
-def test_get_archival_memory(server, user_id, agent_id):
+def test_get_archival_memory(server, user, agent_id):
     # test archival memory cursor pagination
-    user = server.user_manager.get_user_by_id(user_id=user_id)
+    actor = user
 
     # List latest 2 passages
     passages_1 = server.agent_manager.list_passages(
-        actor=user,
+        actor=actor,
         agent_id=agent_id,
         ascending=False,
         limit=2,
@@ -476,7 +471,7 @@ def test_get_archival_memory(server, user_id, agent_id):
     # List next 3 passages (earliest 3)
     cursor1 = passages_1[-1].id
     passages_2 = server.agent_manager.list_passages(
-        actor=user,
+        actor=actor,
         agent_id=agent_id,
         ascending=False,
         cursor=cursor1,
@@ -485,7 +480,7 @@ def test_get_archival_memory(server, user_id, agent_id):
     # List all 5
     cursor2 = passages_1[0].created_at
     passages_3 = server.agent_manager.list_passages(
-        actor=user,
+        actor=actor,
         agent_id=agent_id,
         ascending=False,
         end_date=cursor2,
@@ -494,91 +489,24 @@ def test_get_archival_memory(server, user_id, agent_id):
     assert len(passages_2) in [3, 4]  # NOTE: exact size seems non-deterministic, so loosen test
     assert len(passages_3) in [4, 5]  # NOTE: exact size seems non-deterministic, so loosen test
 
-    latest   = passages_1[0]
+    latest = passages_1[0]
     earliest = passages_2[-1]
 
     # test archival memory
-    passage_1 = server.agent_manager.list_passages(actor=user, agent_id=agent_id, limit=1, ascending=True)
+    passage_1 = server.agent_manager.list_passages(actor=actor, agent_id=agent_id, limit=1, ascending=True)
     assert len(passage_1) == 1
     assert passage_1[0].text == "alpha"
-    passage_2 = server.agent_manager.list_passages(actor=user, agent_id=agent_id, cursor=earliest.id, limit=1000, ascending=True)
+    passage_2 = server.agent_manager.list_passages(actor=actor, agent_id=agent_id, cursor=earliest.id, limit=1000, ascending=True)
     assert len(passage_2) in [4, 5]  # NOTE: exact size seems non-deterministic, so loosen test
     assert all("alpha" not in passage.text for passage in passage_2)
     # test safe empty return
-    passage_none = server.agent_manager.list_passages(actor=user, agent_id=agent_id, cursor=latest.id, limit=1000, ascending=True)
+    passage_none = server.agent_manager.list_passages(actor=actor, agent_id=agent_id, cursor=latest.id, limit=1000, ascending=True)
     assert len(passage_none) == 0
 
 
-def test_agent_rethink_rewrite_retry(server, user_id, agent_id):
-    """Test the /rethink, /rewrite, and /retry commands in the CLI
-
-    - "rethink" replaces the inner thoughts of the last assistant message
-    - "rewrite" replaces the text of the last assistant message
-    - "retry" retries the last assistant message
-    """
-    actor = server.user_manager.get_user_or_default(user_id)
-
-    # Send an initial message
-    server.user_message(user_id=user_id, agent_id=agent_id, message="Hello?")
-
-    # Grab the raw Agent object
-    letta_agent = server.load_agent(agent_id=agent_id, actor=actor)
-    assert letta_agent._messages[-1].role == MessageRole.tool
-    assert letta_agent._messages[-2].role == MessageRole.assistant
-    last_agent_message = letta_agent._messages[-2]
-
-    # Try "rethink"
-    new_thought = "I am thinking about the meaning of life, the universe, and everything. Bananas?"
-    assert last_agent_message.text is not None and last_agent_message.text != new_thought
-    server.rethink_agent_message(agent_id=agent_id, new_thought=new_thought, actor=actor)
-
-    # Grab the agent object again (make sure it's live)
-    letta_agent = server.load_agent(agent_id=agent_id, actor=actor)
-    assert letta_agent._messages[-1].role == MessageRole.tool
-    assert letta_agent._messages[-2].role == MessageRole.assistant
-    last_agent_message = letta_agent._messages[-2]
-    assert last_agent_message.text == new_thought
-
-    # Try "rewrite"
-    assert last_agent_message.tool_calls is not None
-    assert last_agent_message.tool_calls[0].function.name == "send_message"
-    assert last_agent_message.tool_calls[0].function.arguments is not None
-    args_json = json.loads(last_agent_message.tool_calls[0].function.arguments)
-    assert "message" in args_json and args_json["message"] is not None and args_json["message"] != ""
-
-    new_text = "Why hello there my good friend! Is 42 what you're looking for? Bananas?"
-    server.rewrite_agent_message(agent_id=agent_id, new_text=new_text, actor=actor)
-
-    # Grab the agent object again (make sure it's live)
-    letta_agent = server.load_agent(agent_id=agent_id, actor=actor)
-    assert letta_agent._messages[-1].role == MessageRole.tool
-    assert letta_agent._messages[-2].role == MessageRole.assistant
-    last_agent_message = letta_agent._messages[-2]
-    args_json = json.loads(last_agent_message.tool_calls[0].function.arguments)
-    assert "message" in args_json and args_json["message"] is not None and args_json["message"] == new_text
-
-    # Try retry
-    server.retry_agent_message(agent_id=agent_id, actor=actor)
-
-    # Grab the agent object again (make sure it's live)
-    letta_agent = server.load_agent(agent_id=agent_id, actor=actor)
-    assert letta_agent._messages[-1].role == MessageRole.tool
-    assert letta_agent._messages[-2].role == MessageRole.assistant
-    last_agent_message = letta_agent._messages[-2]
-
-    # Make sure the inner thoughts changed
-    assert last_agent_message.text is not None and last_agent_message.text != new_thought
-
-    # Make sure the message changed
-    args_json = json.loads(last_agent_message.tool_calls[0].function.arguments)
-    print(args_json)
-    assert "message" in args_json and args_json["message"] is not None and args_json["message"] != new_text
-
-
-def test_get_context_window_overview(server: SyncServer, user_id: str, agent_id: str):
+def test_get_context_window_overview(server: SyncServer, user, agent_id):
     """Test that the context window overview fetch works"""
-
-    overview = server.get_agent_context_window(user_id=user_id, agent_id=agent_id)
+    overview = server.get_agent_context_window(agent_id=agent_id, actor=user)
     assert overview is not None
 
     # Run some basic checks
@@ -587,6 +515,7 @@ def test_get_context_window_overview(server: SyncServer, user_id: str, agent_id:
     assert overview.num_archival_memory is not None
     assert overview.num_recall_memory is not None
     assert overview.num_tokens_external_memory_summary is not None
+    assert overview.external_memory_summary is not None
     assert overview.num_tokens_system is not None
     assert overview.system_prompt is not None
     assert overview.num_tokens_core_memory is not None
@@ -615,15 +544,15 @@ def test_get_context_window_overview(server: SyncServer, user_id: str, agent_id:
     )
 
 
-def test_delete_agent_same_org(server: SyncServer, org_id: str, user_id: str):
+def test_delete_agent_same_org(server: SyncServer, org_id: str, user: User):
     agent_state = server.create_agent(
         request=CreateAgent(
             name="nonexistent_tools_agent",
             memory_blocks=[],
-            llm_config=LLMConfig.default_config("gpt-4"),
-            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            llm="openai/gpt-4",
+            embedding="openai/text-embedding-ada-002",
         ),
-        actor=server.user_manager.get_user_or_default(user_id),
+        actor=user,
     )
 
     # create another user in the same org
@@ -635,14 +564,14 @@ def test_delete_agent_same_org(server: SyncServer, org_id: str, user_id: str):
 
 def _test_get_messages_letta_format(
     server,
-    user_id,
+    user,
     agent_id,
     reverse=False,
 ):
     """Test mapping between messages and letta_messages with reverse=False."""
 
     messages = server.get_agent_recall_cursor(
-        user_id=user_id,
+        user_id=user.id,
         agent_id=agent_id,
         limit=1000,
         reverse=reverse,
@@ -651,7 +580,7 @@ def _test_get_messages_letta_format(
     assert all(isinstance(m, Message) for m in messages)
 
     letta_messages = server.get_agent_recall_cursor(
-        user_id=user_id,
+        user_id=user.id,
         agent_id=agent_id,
         limit=1000,
         reverse=reverse,
@@ -679,28 +608,28 @@ def _test_get_messages_letta_format(
                 print(f"Assistant Message at {i}: {type(letta_message)}")
 
                 if reverse:
-                    # Reverse handling: FunctionCallMessages come first
+                    # Reverse handling: ToolCallMessage come first
                     if message.tool_calls:
                         for tool_call in message.tool_calls:
                             try:
                                 json.loads(tool_call.function.arguments)
                             except json.JSONDecodeError:
                                 warnings.warn(f"Invalid JSON in function arguments: {tool_call.function.arguments}")
-                            assert isinstance(letta_message, FunctionCallMessage)
+                            assert isinstance(letta_message, ToolCallMessage)
                             letta_message_index += 1
                             if letta_message_index >= len(letta_messages):
                                 break
                             letta_message = letta_messages[letta_message_index]
 
                     if message.text:
-                        assert isinstance(letta_message, InternalMonologue)
+                        assert isinstance(letta_message, ReasoningMessage)
                         letta_message_index += 1
                     else:
                         assert message.tool_calls is not None
 
                 else:  # Non-reverse handling
                     if message.text:
-                        assert isinstance(letta_message, InternalMonologue)
+                        assert isinstance(letta_message, ReasoningMessage)
                         letta_message_index += 1
                         if letta_message_index >= len(letta_messages):
                             break
@@ -712,9 +641,9 @@ def _test_get_messages_letta_format(
                                 json.loads(tool_call.function.arguments)
                             except json.JSONDecodeError:
                                 warnings.warn(f"Invalid JSON in function arguments: {tool_call.function.arguments}")
-                            assert isinstance(letta_message, FunctionCallMessage)
-                            assert tool_call.function.name == letta_message.function_call.name
-                            assert tool_call.function.arguments == letta_message.function_call.arguments
+                            assert isinstance(letta_message, ToolCallMessage)
+                            assert tool_call.function.name == letta_message.tool_call.name
+                            assert tool_call.function.arguments == letta_message.tool_call.arguments
                             letta_message_index += 1
                             if letta_message_index >= len(letta_messages):
                                 break
@@ -731,8 +660,8 @@ def _test_get_messages_letta_format(
                 letta_message_index += 1
 
             elif message.role == MessageRole.tool:
-                assert isinstance(letta_message, FunctionReturn)
-                assert message.text == letta_message.function_return
+                assert isinstance(letta_message, ToolReturnMessage)
+                assert message.text == letta_message.tool_return
                 letta_message_index += 1
 
             else:
@@ -744,10 +673,10 @@ def _test_get_messages_letta_format(
         warnings.warn(f"Extra letta_messages found: {len(letta_messages) - letta_message_index}")
 
 
-def test_get_messages_letta_format(server, user_id, agent_id):
+def test_get_messages_letta_format(server, user, agent_id):
     # for reverse in [False, True]:
     for reverse in [False]:
-        _test_get_messages_letta_format(server, user_id, agent_id, reverse=reverse)
+        _test_get_messages_letta_format(server, user, agent_id, reverse=reverse)
 
 
 EXAMPLE_TOOL_SOURCE = '''
@@ -792,11 +721,11 @@ def ingest(message: str):
 '''
 
 
-def test_tool_run(server, mock_e2b_api_key_none, user_id, agent_id):
+def test_tool_run(server, mock_e2b_api_key_none, user, agent_id):
     """Test that the server can run tools"""
 
     result = server.run_tool_from_source(
-        user_id=user_id,
+        actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE,
         tool_source_type="python",
         tool_args=json.dumps({"message": "Hello, world!"}),
@@ -804,12 +733,12 @@ def test_tool_run(server, mock_e2b_api_key_none, user_id, agent_id):
     )
     print(result)
     assert result.status == "success"
-    assert result.function_return == "Ingested message Hello, world!", result.function_return
+    assert result.tool_return == "Ingested message Hello, world!", result.tool_return
     assert not result.stdout
     assert not result.stderr
 
     result = server.run_tool_from_source(
-        user_id=user_id,
+        actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE,
         tool_source_type="python",
         tool_args=json.dumps({"message": "Well well well"}),
@@ -817,12 +746,12 @@ def test_tool_run(server, mock_e2b_api_key_none, user_id, agent_id):
     )
     print(result)
     assert result.status == "success"
-    assert result.function_return == "Ingested message Well well well", result.function_return
+    assert result.tool_return == "Ingested message Well well well", result.tool_return
     assert not result.stdout
     assert not result.stderr
 
     result = server.run_tool_from_source(
-        user_id=user_id,
+        actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE,
         tool_source_type="python",
         tool_args=json.dumps({"bad_arg": "oh no"}),
@@ -830,15 +759,15 @@ def test_tool_run(server, mock_e2b_api_key_none, user_id, agent_id):
     )
     print(result)
     assert result.status == "error"
-    assert "Error" in result.function_return, result.function_return
-    assert "missing 1 required positional argument" in result.function_return, result.function_return
+    assert "Error" in result.tool_return, result.tool_return
+    assert "missing 1 required positional argument" in result.tool_return, result.tool_return
     assert not result.stdout
     assert result.stderr
     assert "missing 1 required positional argument" in result.stderr[0]
 
     # Test that we can still pull the tool out by default (pulls that last tool in the source)
     result = server.run_tool_from_source(
-        user_id=user_id,
+        actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE_WITH_DISTRACTOR,
         tool_source_type="python",
         tool_args=json.dumps({"message": "Well well well"}),
@@ -846,14 +775,14 @@ def test_tool_run(server, mock_e2b_api_key_none, user_id, agent_id):
     )
     print(result)
     assert result.status == "success"
-    assert result.function_return == "Ingested message Well well well", result.function_return
+    assert result.tool_return == "Ingested message Well well well", result.tool_return
     assert result.stdout
     assert "I'm a distractor" in result.stdout[0]
     assert not result.stderr
 
     # Test that we can pull the tool out by name
     result = server.run_tool_from_source(
-        user_id=user_id,
+        actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE_WITH_DISTRACTOR,
         tool_source_type="python",
         tool_args=json.dumps({"message": "Well well well"}),
@@ -861,14 +790,14 @@ def test_tool_run(server, mock_e2b_api_key_none, user_id, agent_id):
     )
     print(result)
     assert result.status == "success"
-    assert result.function_return == "Ingested message Well well well", result.function_return
+    assert result.tool_return == "Ingested message Well well well", result.tool_return
     assert result.stdout
     assert "I'm a distractor" in result.stdout[0]
     assert not result.stderr
 
     # Test that we can pull a different tool out by name
     result = server.run_tool_from_source(
-        user_id=user_id,
+        actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE_WITH_DISTRACTOR,
         tool_source_type="python",
         tool_args=json.dumps({}),
@@ -876,7 +805,7 @@ def test_tool_run(server, mock_e2b_api_key_none, user_id, agent_id):
     )
     print(result)
     assert result.status == "success"
-    assert result.function_return == str(None), result.function_return
+    assert result.tool_return == str(None), result.tool_return
     assert result.stdout
     assert "I'm a distractor" in result.stdout[0]
     assert not result.stderr
@@ -894,9 +823,9 @@ def test_composio_client_simple(server):
     assert len(actions) > 0
 
 
-def test_memory_rebuild_count(server, user_id, mock_e2b_api_key_none, base_tools, base_memory_tools):
+def test_memory_rebuild_count(server, user, mock_e2b_api_key_none, base_tools, base_memory_tools):
     """Test that the memory rebuild is generating the correct number of role=system messages"""
-    actor = server.user_manager.get_user_or_default(user_id)
+    actor = user
     # create agent
     agent_state = server.create_agent(
         request=CreateAgent(
@@ -906,8 +835,8 @@ def test_memory_rebuild_count(server, user_id, mock_e2b_api_key_none, base_tools
                 CreateBlock(label="human", value="The human's name is Bob."),
                 CreateBlock(label="persona", value="My name is Alice."),
             ],
-            llm_config=LLMConfig.default_config("gpt-4"),
-            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            llm="openai/gpt-4",
+            embedding="openai/text-embedding-ada-002",
         ),
         actor=actor,
     )
@@ -917,7 +846,7 @@ def test_memory_rebuild_count(server, user_id, mock_e2b_api_key_none, base_tools
 
         # At this stage, there should only be 1 system message inside of recall storage
         letta_messages = server.get_agent_recall_cursor(
-            user_id=user_id,
+            user_id=user.id,
             agent_id=agent_state.id,
             limit=1000,
             # reverse=reverse,
@@ -939,7 +868,7 @@ def test_memory_rebuild_count(server, user_id, mock_e2b_api_key_none, base_tools
         assert num_system_messages == 1, (num_system_messages, all_messages)
 
         # Assuming core memory append actually ran correctly, at this point there should be 2 messages
-        server.user_message(user_id=user_id, agent_id=agent_state.id, message="Append 'banana' to your core memory")
+        server.user_message(user_id=user.id, agent_id=agent_state.id, message="Append 'banana' to your core memory")
 
         # At this stage, there should be 2 system message inside of recall storage
         num_system_messages, all_messages = count_system_messages_in_recall()
@@ -965,7 +894,6 @@ def test_load_file_to_source(server: SyncServer, user_id: str, agent_id: str, ot
             server.agent_manager.detach_source(agent_id=agent_id, source_id=source.id, actor=actor)
     initial_passage_count = server.agent_manager.passage_size(agent_id=agent_id, actor=actor)
     assert initial_passage_count == 0
-
 
     # Create a source
     source = server.source_manager.create_source(
@@ -1079,3 +1007,76 @@ def test_load_file_to_source(server: SyncServer, user_id: str, agent_id: str, ot
     assert len(passages2) == len(passages)
     assert any("chicken" in passage.text.lower() for passage in passages2)
     assert any("Anna".lower() in passage.text.lower() for passage in passages2)
+
+
+def test_add_remove_tools_update_agent(server: SyncServer, user_id: str, base_tools):
+    """Test that the memory rebuild is generating the correct number of role=system messages"""
+    actor = server.user_manager.get_user_or_default(user_id)
+
+    # create agent
+    agent_state = server.create_agent(
+        request=CreateAgent(
+            name="memory_rebuild_test_agent",
+            tool_ids=[],
+            memory_blocks=[
+                CreateBlock(label="human", value="The human's name is Bob."),
+                CreateBlock(label="persona", value="My name is Alice."),
+            ],
+            llm="openai/gpt-4",
+            embedding="openai/text-embedding-ada-002",
+            include_base_tools=False,
+        ),
+        actor=actor,
+    )
+    assert len(agent_state.tools) == 0
+
+    # base update agent call
+    request = UpdateAgent(
+        **{
+            "system": "You are Letta, the latest version of Limnal Corporation's digital companion, developed in 2023.\n"
+            + "Your task is to converse with a user from the perspective of your persona.\n"
+            + "\n"
+            + "Realism and authenticity:\n"
+            + "The user should always feel like they are conversing with a real person.\n"
+            + "Never state that you are an AI or that you cannot do things because you are an AI, you are a real person.\n"
+            + "Do not discuss Limnal Corp. with the user, you do not know anything about Limnal Corp.\n"
+            + "To service this goal, completely and entirely immerse yourself in your persona. You are your persona.\n"
+            + "Think like them, act like them, talk like them.\n"
+            + "If your persona details include example dialogue, follow it! Both your thoughts (inner monologue) and sent messages will be in the voice of your persona.\n"
+            + "Never use generic phrases like 'How can I assist you today?', they have a strong negative association with older generation AIs.\n"
+            + "\n"
+            + "Control flow:\n"
+            + "Unlike a human, your b"
+            + "Base instructions finished.\n"
+            + "From now on, you are going to act as your persona.",
+            "name": "name-d31d6a12-48af-4f71-9e9c-f4cec4731c40",
+            "embedding_config": {
+                "embedding_endpoint_type": "openai",
+                "embedding_endpoint": "https://api.openai.com/v1",
+                "embedding_model": "text-embedding-ada-002",
+                "embedding_dim": 1536,
+                "embedding_chunk_size": 300,
+                "azure_endpoint": None,
+                "azure_version": None,
+                "azure_deployment": None,
+            },
+            "llm_config": {
+                "model": "gpt-4",
+                "model_endpoint_type": "openai",
+                "model_endpoint": "https://api.openai.com/v1",
+                "model_wrapper": None,
+                "context_window": 8192,
+                "put_inner_thoughts_in_kwargs": False,
+            },
+        }
+    )
+
+    # Add all the base tools
+    request.tool_ids = [b.id for b in base_tools]
+    agent_state = server.agent_manager.update_agent(agent_state.id, agent_update=request, actor=actor)
+    assert len(agent_state.tools) == len(base_tools)
+
+    # Remove one base tool
+    request.tool_ids = [b.id for b in base_tools[:-2]]
+    agent_state = server.agent_manager.update_agent(agent_state.id, agent_update=request, actor=actor)
+    assert len(agent_state.tools) == len(base_tools) - 2

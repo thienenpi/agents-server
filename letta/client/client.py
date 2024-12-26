@@ -233,7 +233,7 @@ class AbstractClient(object):
     def get_tool_id(self, name: str) -> Optional[str]:
         raise NotImplementedError
 
-    def add_base_tools(self) -> List[Tool]:
+    def upsert_base_tools(self) -> List[Tool]:
         raise NotImplementedError
 
     def load_data(self, connector: DataConnector, source_name: str):
@@ -1466,7 +1466,7 @@ class RESTClient(AbstractClient):
             raise ValueError(f"Failed to get tool: {response.text}")
         return response.json()
 
-    def add_base_tools(self) -> List[Tool]:
+    def upsert_base_tools(self) -> List[Tool]:
         response = requests.post(f"{self.base_url}/{self.api_prefix}/tools/add-base-tools/", headers=self.headers)
         if response.status_code != 200:
             raise ValueError(f"Failed to add base tools: {response.text}")
@@ -2156,6 +2156,7 @@ class LocalClient(AbstractClient):
             "block_ids": [b.id for b in memory.get_blocks()] + block_ids,
             "tool_ids": tool_ids,
             "tool_rules": tool_rules,
+            "include_base_tools": include_base_tools,
             "system": system,
             "agent_type": agent_type,
             "llm_config": llm_config if llm_config else self._default_llm_config,
@@ -2233,7 +2234,7 @@ class LocalClient(AbstractClient):
         """
         # TODO: add the abilitty to reset linked block_ids
         self.interface.clear()
-        agent_state = self.server.update_agent(
+        agent_state = self.server.agent_manager.update_agent(
             agent_id,
             UpdateAgent(
                 name=name,
@@ -2261,7 +2262,7 @@ class LocalClient(AbstractClient):
             List[Tool]: A list of Tool objs
         """
         self.interface.clear()
-        return self.server.get_tools_from_agent(agent_id=agent_id, user_id=self.user_id)
+        return self.server.agent_manager.get_agent_by_id(agent_id=agent_id, actor=self.user).tools
 
     def add_tool_to_agent(self, agent_id: str, tool_id: str):
         """
@@ -2275,7 +2276,7 @@ class LocalClient(AbstractClient):
             agent_state (AgentState): State of the updated agent
         """
         self.interface.clear()
-        agent_state = self.server.add_tool_to_agent(agent_id=agent_id, tool_id=tool_id, user_id=self.user_id)
+        agent_state = self.server.agent_manager.attach_tool(agent_id=agent_id, tool_id=tool_id, actor=self.user)
         return agent_state
 
     def remove_tool_from_agent(self, agent_id: str, tool_id: str):
@@ -2290,7 +2291,7 @@ class LocalClient(AbstractClient):
             agent_state (AgentState): State of the updated agent
         """
         self.interface.clear()
-        agent_state = self.server.remove_tool_from_agent(agent_id=agent_id, tool_id=tool_id, user_id=self.user_id)
+        agent_state = self.server.agent_manager.detach_tool(agent_id=agent_id, tool_id=tool_id, actor=self.user)
         return agent_state
 
     def rename_agent(self, agent_id: str, new_name: str):
@@ -2425,7 +2426,7 @@ class LocalClient(AbstractClient):
         Returns:
             messages (List[Message]): List of in-context messages
         """
-        return self.server.get_in_context_messages(agent_id=agent_id, actor=self.user)
+        return self.server.agent_manager.get_in_context_messages(agent_id=agent_id, actor=self.user)
 
     # agent interactions
 
@@ -2908,7 +2909,7 @@ class LocalClient(AbstractClient):
         job = self.server.job_manager.create_job(pydantic_job=job, actor=self.user)
 
         # TODO: implement blocking vs. non-blocking
-        self.server.load_file_to_source(source_id=source_id, file_path=filename, job_id=job.id)
+        self.server.load_file_to_source(source_id=source_id, file_path=filename, job_id=job.id, actor=self.user)
         return job
 
     def delete_file_from_source(self, source_id: str, file_id: str):
@@ -2986,7 +2987,11 @@ class LocalClient(AbstractClient):
             source_id (str): ID of the source
             source_name (str): Name of the source
         """
-        self.server.attach_source_to_agent(source_id=source_id, source_name=source_name, agent_id=agent_id, user_id=self.user_id)
+        if source_name:
+            source = self.server.source_manager.get_source_by_id(source_id=source_id, actor=self.user)
+            source_id = source.id
+
+        self.server.agent_manager.attach_source(source_id=source_id, agent_id=agent_id, actor=self.user)
 
     def detach_source_from_agent(self, agent_id: str, source_id: Optional[str] = None, source_name: Optional[str] = None):
         """
@@ -2998,7 +3003,10 @@ class LocalClient(AbstractClient):
         Returns:
             source (Source): Detached source
         """
-        return self.server.detach_source_from_agent(source_id=source_id, source_name=source_name, agent_id=agent_id, user_id=self.user_id)
+        if source_name:
+            source = self.server.source_manager.get_source_by_id(source_id=source_id, actor=self.user)
+            source_id = source.id
+        return self.server.agent_manager.detach_source(agent_id=agent_id, source_id=source_id, actor=self.user)
 
     def list_sources(self) -> List[Source]:
         """
@@ -3074,7 +3082,7 @@ class LocalClient(AbstractClient):
             agent_id (str): ID of the agent
             memory_id (str): ID of the memory
         """
-        self.server.delete_archival_memory(agent_id=agent_id, memory_id=memory_id, actor=self.user)
+        self.server.delete_archival_memory(memory_id=memory_id, actor=self.user)
 
     def get_archival_memory(
         self, agent_id: str, before: Optional[str] = None, after: Optional[str] = None, limit: Optional[int] = 1000
